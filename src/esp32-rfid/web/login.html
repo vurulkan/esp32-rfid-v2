@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP32 RFID Access Control System</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body class="login-body">
+  <div class="login-page">
+    <div class="login-card">
+      <div>
+        <div class="login-title">ESP32 RFID Access Control</div>
+        <div class="login-subtitle">Sign in to continue</div>
+      </div>
+      <form id="login-form">
+        <label class="field">Username <input class="text-input" type="text" id="login-user" autocomplete="username" required></label>
+        <label class="field">Password <input class="text-input" type="password" id="login-pass" autocomplete="current-password" required></label>
+        <button type="submit">Sign In</button>
+        <div id="login-error" class="hint is-hidden">Invalid credentials.</div>
+      </form>
+    </div>
+    <footer class="footer login-footer">
+      <span>Made by <a href="https://github.com/vurulkan" target="_blank" rel="noopener">vurulkan</a></span>
+      <span class="footer-sep">|</span>
+      <span>v1.0.0</span>
+    </footer>
+  </div>
+  <script>
+    const form = document.getElementById('login-form');
+    const error = document.getElementById('login-error');
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      error.classList.add('is-hidden');
+      const user = document.getElementById('login-user').value.trim();
+      const pass = document.getElementById('login-pass').value;
+      if (!user || !pass) {
+        error.textContent = 'Username and password are required.';
+        error.classList.remove('is-hidden');
+        return;
+      }
+      const params = new URLSearchParams();
+      params.set('user', user);
+      params.set('pass', pass);
+      const res = await fetch('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        credentials: 'same-origin',
+        body: params.toString()
+      });
+      if (res.ok) {
+        window.location = '/';
+        return;
+      }
+      error.textContent = 'Invalid credentials.';
+      error.classList.remove('is-hidden');
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP32 RFID Access Control System</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-logo">ESP32 RFID</div>
+        <div class="brand-sub">Access Control</div>
+      </div>
+      <nav class="menu">
+        <button class="menu-item is-active" data-target="status">Status</button>
+        <button class="menu-item" data-target="settings">Settings</button>
+        <button class="menu-item" data-target="users">Users</button>
+        <button class="menu-item" data-target="logs">Logs</button>
+        <button class="menu-item" data-target="backup">Backup &amp; Restore</button>
+        <button class="menu-item" data-target="maintenance">Maintenance</button>
+      </nav>
+      <div class="sidebar-footer">
+        <a class="menu-link" href="https://github.com/vurulkan/esp32-rfid" target="_blank" rel="noopener">View on GitHub</a>
+        <button class="menu-link is-hidden" id="logout" type="button">Logout</button>
+      </div>
+    </aside>
+
+    <main class="content">
+    <section class="page is-active" id="page-status">
+      <header class="page-header">
+        <h1>Welcome</h1>
+        <p>Device status and network information.</p>
+      </header>
+
+      <div class="card">
+        <div class="card-title">ESP32 RFID ACCESS CONTROL</div>
+      </div>
+
+      <div class="grid two">
+        <div class="card">
+          <div class="card-title">DEVICE</div>
+          <div class="row"><span>System name</span><span id="device-name">-</span></div>
+          <div class="row"><span>Chip model</span><span id="device-model">-</span></div>
+          <div class="row"><span>Chip rev</span><span id="device-rev">-</span></div>
+          <div class="row"><span>Cores</span><span id="device-cores">-</span></div>
+          <div class="row"><span>CPU clock</span><span id="device-cpu">-</span></div>
+          <div class="row"><span>Uptime</span><span id="device-uptime">-</span></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">MEMORY</div>
+          <div class="metric">
+            <div class="metric-label">Heap</div>
+            <div class="bar"><div class="bar-fill" id="heap-bar"></div></div>
+            <div class="metric-value" id="heap-text">-</div>
+          </div>
+          <div class="metric">
+            <div class="metric-label">Flash</div>
+            <div class="bar"><div class="bar-fill" id="flash-bar"></div></div>
+            <div class="metric-value" id="flash-text">-</div>
+          </div>
+          <div class="metric">
+            <div class="metric-label">LittleFS</div>
+            <div class="bar"><div class="bar-fill" id="fs-bar"></div></div>
+            <div class="metric-value" id="fs-text">-</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">NETWORK</div>
+        <div class="row"><span>Mode</span><span id="net-mode">-</span></div>
+        <div class="row"><span>SSID</span><span id="net-ssid">-</span></div>
+        <div class="row"><span>IP</span><span id="net-ip">-</span></div>
+        <div class="row"><span>Gateway</span><span id="net-gw">-</span></div>
+        <div class="row"><span>Mask</span><span id="net-mask">-</span></div>
+        <div class="row"><span>MAC</span><span id="net-mac">-</span></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">LAST RFID</div>
+        <pre id="rfid"></pre>
+      </div>
+    </section>
+
+    <section class="page" id="page-users">
+      <header class="page-header">
+        <h1>Users</h1>
+        <p>Manage card access permissions.</p>
+      </header>
+      <div class="card">
+        <form id="user-form">
+          <label class="field">UID <input class="text-input" name="uid" placeholder="04A1B2C3"></label>
+          <button type="button" id="use-last">Use Last Card</button>
+          <label class="field">Name <input class="text-input" name="name" placeholder="User" required></label>
+          <label class="check">
+            <input type="checkbox" name="relay1">
+            <span id="relay1-label">Relay 1</span>
+            <span class="muted-note">(Relay 1)</span>
+          </label>
+          <label class="check">
+            <input type="checkbox" name="relay2">
+            <span id="relay2-label">Relay 2</span>
+            <span class="muted-note">(Relay 2)</span>
+          </label>
+          <button type="submit">Save</button>
+        </form>
+      </div>
+      <div class="card">
+        <div class="card-title">REGISTERED USERS</div>
+        <div class="bulk-actions">
+          <button id="select-all-users">Select All</button>
+          <button id="deselect-all-users">Deselect All</button>
+          <button id="delete-selected-users">Delete Selected</button>
+        </div>
+        <div id="users"></div>
+      </div>
+    </section>
+
+    <section class="page" id="page-settings">
+      <header class="page-header">
+        <h1>Settings</h1>
+        <p>Optional modules and device preferences.</p>
+      </header>
+      <div class="card">
+        <div class="card-title">AUTHENTICATION</div>
+        <label class="check">
+          <input type="checkbox" id="auth-enabled">
+          Enable authentication
+        </label>
+        <div id="auth-fields" class="is-hidden">
+        <label class="field">Username <input class="text-input" type="text" id="auth-user" placeholder="admin"></label>
+        <label class="field">Password <input class="text-input" type="password" id="auth-pass" placeholder="password"></label>
+        </div>
+        <button id="save-auth">Save Authentication</button>
+        <div id="auth-hint" class="hint is-hidden">API key is shown once after enabling. Store it safely.</div>
+        <div id="api-key-display" class="muted-note is-hidden"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">WIFI CLIENT MODE</div>
+        <label class="check">
+          <input type="checkbox" id="wifi-client">
+          Enable client mode
+        </label>
+        <div id="wifi-client-fields" class="is-hidden">
+          <div class="hint">Provide SSID and password to connect.</div>
+          <label class="field">SSID <input class="text-input" type="text" id="wifi-ssid" placeholder="Network SSID"></label>
+          <label class="field">Password <input class="text-input" type="password" id="wifi-pass" placeholder="Network password"></label>
+          <label class="check">
+            <input type="checkbox" id="wifi-static">
+            Use static IP
+          </label>
+          <div id="wifi-static-fields" class="is-hidden">
+            <label class="field">IP <input class="text-input" type="text" id="wifi-ip" placeholder="192.168.1.50"></label>
+            <label class="field">Gateway <input class="text-input" type="text" id="wifi-gateway" placeholder="192.168.1.1"></label>
+            <label class="field">Mask <input class="text-input" type="text" id="wifi-mask" placeholder="255.255.255.0"></label>
+          </div>
+        </div>
+        <button id="wifi-save">Save WiFi Settings</button>
+      </div>
+
+      <div class="card">
+        <div class="card-title">RELAY NAMES</div>
+        <label class="field">Relay 1 <input class="text-input" type="text" id="relay1-name" placeholder="Relay 1"></label>
+        <label class="field">Relay 2 <input class="text-input" type="text" id="relay2-name" placeholder="Relay 2"></label>
+        <button id="save-relay-names">Save Relay Names</button>
+      </div>
+      <div class="card">
+        <div class="card-title">RTC</div>
+        <label class="check">
+          <input type="checkbox" id="rtc-enabled">
+          Enable DS3231
+        </label>
+        <div class="is-hidden" id="rtc-config">
+          <div class="card-title">DATE &amp; TIME</div>
+          <label class="field">Date/Time <input class="text-input" type="datetime-local" id="rtc-datetime"></label>
+          <button id="rtc-set">Set RTC</button>
+          <button id="rtc-read">Read RTC</button>
+          <div id="rtc-status" class="hint"></div>
+          <button id="rtc-save">Save RTC Settings</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="page" id="page-logs">
+      <header class="page-header">
+        <h1>Logs</h1>
+        <p>Event history stored in flash (LittleFS).</p>
+      </header>
+      <div class="card">
+        <div class="bulk-actions">
+          <button id="clear-ram-logs">Clear RAM Logs</button>
+          <button id="clear-all-logs">Clear All Logs</button>
+          <button id="download-logs">Download logs.txt</button>
+        </div>
+        <div id="logs"></div>
+      </div>
+    </section>
+
+    <section class="page" id="page-maintenance">
+      <header class="page-header">
+        <h1>Maintenance</h1>
+        <p>Device actions and maintenance tools.</p>
+      </header>
+      <div class="card">
+        <div class="card-title">RELAY TEST</div>
+        <label class="field">Pulse Duration (ms) <input class="text-input" type="number" id="relay-pulse-ms" value="600" min="50" max="10000"></label>
+        <div class="bulk-actions">
+          <button id="trigger-relay1">Pulse <span id="maint-relay1-label">Relay 1</span></button>
+          <button id="trigger-relay2">Pulse <span id="maint-relay2-label">Relay 2</span></button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">RELAY MANUAL</div>
+        <div class="toggle-row">
+          <div class="toggle-label" id="relay1-state-text">Relay 1: OFF</div>
+          <label class="toggle">
+            <input type="checkbox" id="relay1-toggle">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <div class="toggle-row">
+          <div class="toggle-label" id="relay2-state-text">Relay 2: OFF</div>
+          <label class="toggle">
+            <input type="checkbox" id="relay2-toggle">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">UART TEST</div>
+        <button id="uart-test">Test Nano Link</button>
+        <div class="hint" id="uart-test-status"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">READER TEST</div>
+        <div class="bulk-actions">
+          <button id="reader1-test-allow">Reader 1 Allow</button>
+          <button id="reader1-test-deny">Reader 1 Deny</button>
+          <button id="reader2-test-allow">Reader 2 Allow</button>
+          <button id="reader2-test-deny">Reader 2 Deny</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">LITTLEFS</div>
+        <button id="format-fs">Format LittleFS</button>
+      </div>
+      <div class="card">
+        <div class="card-title">DEVICE</div>
+        <button id="reboot-device">Reboot Device</button>
+      </div>
+    </section>
+
+    <section class="page" id="page-backup">
+      <header class="page-header">
+        <h1>Backup &amp; Restore</h1>
+        <p>Export or import users, settings.</p>
+      </header>
+      <div class="card">
+        <div class="card-title">BACKUP</div>
+        <button id="backup-users">Backup Users</button>
+        <button id="backup-settings">Backup Settings</button>
+      </div>
+      <div class="card">
+        <div class="card-title">RESTORE</div>
+        <label>Users or settings file
+          <input type="file" id="restore-file" accept=".txt">
+        </label>
+        <button id="restore-apply">Restore</button>
+        <div id="restore-status" class="hint"></div>
+      </div>
+    </section>
+    </main>
+  </div>
+
+  <footer class="footer">
+    <span>Made by <a href="https://github.com/vurulkan" target="_blank" rel="noopener">vurulkan</a></span>
+    <span class="footer-sep">|</span>
+    <span>v1.0.0</span>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>
