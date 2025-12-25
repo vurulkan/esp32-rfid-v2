@@ -92,6 +92,8 @@ LED/BEEP lines are active-low (pull to GND to trigger).
 ### DS3231 RTC (optional, I2C)
 - SDA: GPIO21
 - SCL: GPIO22
+- GND: GND
+- VCC: 3.3V or 5V (according to your module)
 
 ### IO0 (maintenance)
 - Actions are decided **when the button is released** (press duration).
@@ -184,8 +186,14 @@ LED/BEEP lines are active-low (pull to GND to trigger).
 - Logout is explicit; browsers cannot reliably distinguish refresh vs close.
 
 ## Notes
-- If you edit `src/esp32-rfid/web/*`, regenerate `*.gz.h` assets.
 - Maintenance tasks can be done via UI or IO0 button (2-5s WiFi reset, 5-10s auth disable, 10s+ format).
+
+### Regenerate Web Assets
+- If you edit `src/esp32-rfid/web/*`, regenerate `*.gz.h` assets.
+  Place `pack_web.py` inside `src/esp32-rfid/web/` and run:
+```
+python pack_web.py
+```
 
 ## UART Protocol (Nano -> ESP32)
 - One line per card read, terminated by `\\n`
