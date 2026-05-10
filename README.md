@@ -159,6 +159,8 @@ constexpr uint32_t kRelayPulseMs = 1000;
 constexpr size_t kMaxFileLogs = 50000;
 ```
 
+> **Note on `kMaxFileLogs`:** The default 4MB partition gives LittleFS approximately 1.5 MB. At ~70 bytes per log entry (with RTC), the physical ceiling is around 21,000 entries. Trim requires free space to write a temporary file, so if LittleFS fills up the trim cannot run and new entries will silently stop being written. Keep `kMaxFileLogs` at or below **~15,000** to stay safely within the filesystem capacity.
+
 Recompile and upload after any change.
 
 ## Build & Upload (Arduino IDE)
