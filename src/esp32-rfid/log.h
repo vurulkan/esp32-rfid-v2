@@ -27,6 +27,7 @@ class LogBuffer {
   LogEntry entries_[kMaxLogs];
   size_t head_ = 0;
   size_t count_ = 0;
+  size_t file_count_ = 0;
 };
 
 } // namespace app

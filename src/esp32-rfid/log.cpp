@@ -27,22 +27,16 @@ size_t count_lines(File& file) {
   return count;
 }
 
-bool trim_file_if_needed() {
+bool trim_file_if_needed(size_t& file_count) {
+  if (file_count <= kMaxFileLogs) {
+    return true;
+  }
   if (!ensure_fs()) {
     return false;
   }
-  File src = LittleFS.open(kLogsPath, FILE_READ);
-  if (!src) {
-    return false;
-  }
-  size_t total = count_lines(src);
-  src.close();
-  if (total <= kMaxFileLogs) {
-    return true;
-  }
 
-  size_t skip = total - kMaxFileLogs;
-  src = LittleFS.open(kLogsPath, FILE_READ);
+  size_t skip = file_count - kMaxFileLogs;
+  File src = LittleFS.open(kLogsPath, FILE_READ);
   if (!src) {
     return false;
   }
@@ -67,6 +61,7 @@ bool trim_file_if_needed() {
   dst.close();
   LittleFS.remove(kLogsPath);
   LittleFS.rename(kLogsTmpPath, kLogsPath);
+  file_count = kMaxFileLogs;
   return true;
 }
 
@@ -103,12 +98,14 @@ bool LogBuffer::load() {
     return false;
   }
   if (!LittleFS.exists(kLogsPath)) {
+    file_count_ = 0;
     return true;
   }
   File file = LittleFS.open(kLogsPath, FILE_READ);
   if (!file) {
     return false;
   }
+  file_count_ = 0;
   while (file.available()) {
     String line = file.readStringUntil('\n');
     line.trim();
@@ -122,6 +119,7 @@ bool LogBuffer::load() {
     String ts = line.substring(0, p1);
     String msg = line.substring(p1 + 1);
     add_internal(msg.c_str(), static_cast<uint32_t>(ts.toInt()), false);
+    ++file_count_;
   }
   file.close();
   return true;
@@ -176,7 +174,8 @@ void LogBuffer::add_internal(const char* msg, uint32_t ts_ms, bool persist) {
     line += ',';
     line += msg;
     append_line(line);
-    trim_file_if_needed();
+    ++file_count_;
+    trim_file_if_needed(file_count_);
   }
 }
 
@@ -238,6 +237,7 @@ bool LogBuffer::import_text(const char* text) {
     String ts = line.substring(0, p1);
     String msg = line.substring(p1 + 1);
     add_internal(msg.c_str(), static_cast<uint32_t>(ts.toInt()), false);
+    ++file_count_;
   }
   return save();
 }
@@ -249,6 +249,7 @@ void LogBuffer::clear_ram() {
 
 void LogBuffer::clear_all() {
   clear_ram();
+  file_count_ = 0;
   if (!ensure_fs()) {
     return;
   }

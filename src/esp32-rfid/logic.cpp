@@ -154,8 +154,6 @@ void logic_task(void* param) {
         } else {
           snprintf(log_msg, sizeof(log_msg), "%s", base_msg);
         }
-        logs.add(log_msg, last_rfid.ts_ms);
-        
         if (!allowed) {
           send_uart_feedback(queues, relay_id, false);
         }
@@ -163,6 +161,8 @@ void logic_task(void* param) {
         if (allowed) {
           relay_activate(relay_id, kRelayPulseMs);
         }
+
+        logs.add(log_msg, last_rfid.ts_ms);
       }
       continue;
     }

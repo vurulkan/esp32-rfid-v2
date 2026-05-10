@@ -138,6 +138,29 @@ LED/BEEP lines are active-low (pull to GND to trigger).
 - `POST /restore` with plain text body (auto-detects settings/users sections)
 - Logs can be downloaded via `/logs/export`
 
+## Configurable Constants
+
+These values can be changed before compiling:
+
+| Constant | File | Default | Description |
+| --- | --- | --- | --- |
+| `kRelayPulseMs` | `src/esp32-rfid/logic.cpp` | `600` | Relay activation duration on card read (ms) |
+| `kMaxFileLogs` | `src/esp32-rfid/log.cpp` | `10000` | Maximum log entries stored in LittleFS |
+
+**Example — change relay pulse to 1 second:**
+```cpp
+// logic.cpp
+constexpr uint32_t kRelayPulseMs = 1000;
+```
+
+**Example — increase log limit to 50,000:**
+```cpp
+// log.cpp
+constexpr size_t kMaxFileLogs = 50000;
+```
+
+Recompile and upload after any change.
+
 ## Build & Upload (Arduino IDE)
 1. Install ESP32 core (2.0.17 recommended).
 2. Open `src/esp32-rfid` as the sketch folder.
