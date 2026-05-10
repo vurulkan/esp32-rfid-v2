@@ -524,7 +524,14 @@ void web_task(void* param) {
     memset(&req, 0, sizeof(req));
     memset(&resp, 0, sizeof(resp));
     if (server.method() == HTTP_GET) {
+      uint16_t offset = server.hasArg("offset") ? static_cast<uint16_t>(server.arg("offset").toInt()) : 0;
+      uint16_t limit = server.hasArg("limit") ? static_cast<uint16_t>(server.arg("limit").toInt()) : 50;
+      if (limit == 0 || limit > 100) {
+        limit = 50;
+      }
       req.type = LogicRequestType::GetUsers;
+      req.payload.get_users.offset = offset;
+      req.payload.get_users.limit = limit;
       if (logic_request(queues, req, &resp, 300)) {
         server.send(200, "application/json", resp.json);
       } else {

@@ -175,7 +175,13 @@ void logic_task(void* param) {
 
       switch (req.type) {
         case LogicRequestType::GetUsers: {
-          String json = users.to_json();
+          size_t offset = req.payload.get_users.offset;
+          size_t limit = req.payload.get_users.limit;
+          if (limit == 0 || limit > 100) {
+            limit = 50;
+          }
+          size_t total = 0;
+          String json = users.to_json_page(offset, limit, total);
           send_response(req.reply_queue, true, json);
           break;
         }

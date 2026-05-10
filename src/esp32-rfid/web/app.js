@@ -78,9 +78,23 @@ async function loadStatus() {
 }
 
 async function loadUsers() {
-  const data = await fetchJson('/users');
+  const limit = 50;
+  let offset = 0;
+  let allUsers = [];
+  let total = 0;
+  do {
+    const data = await fetchJson(`/users?offset=${offset}&limit=${limit}`);
+    const page = data.users || [];
+    allUsers = allUsers.concat(page);
+    total = (typeof data.total === 'number') ? data.total : allUsers.length;
+    offset += page.length;
+    if (page.length < limit) {
+      break;
+    }
+  } while (allUsers.length < total);
+
   const usersDiv = document.getElementById('users');
-  usersDiv.innerHTML = renderUsers(data.users || []);
+  usersDiv.innerHTML = renderUsers(allUsers);
   usersDiv.querySelectorAll('button[data-uid]').forEach(btn => {
     btn.addEventListener('click', async () => {
       const uid = btn.getAttribute('data-uid');

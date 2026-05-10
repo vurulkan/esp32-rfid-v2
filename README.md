@@ -154,26 +154,243 @@ LED/BEEP lines are active-low (pull to GND to trigger).
 - If you see LittleFS mount errors on first boot, format it via Maintenance -> "Format LittleFS" or hold IO0 for 10+ seconds.
 
 ## REST API
-- `GET /` UI (gzip)
-- `GET /login` Login page (gzip)
-- `GET /app.js`, `GET /style.css` (gzip)
-- `GET /users`
-- `POST /users` (uid, name, relay1, relay2)
-- `DELETE /users` (uid)
-- `GET /logs`
-- `DELETE /logs?scope=ram|all`
-- `GET /logs/export`
-- `GET /rfid`
-- `GET /status`
-- `GET /backup?type=users|settings`
-- `POST /restore`
-- `POST /auth/login`
-- `POST /auth/logout`
-- `POST /maintenance/format`
-- `POST /maintenance/uart-test`
-- `POST /maintenance/reader-test` (reader=1|2, action=allow|deny)
-- `POST /maintenance/relay` (relay=1|2, action=pulse|on|off, duration_ms=50..10000)
-- `POST /maintenance/reboot`
+
+Base URL: `http://192.168.4.1` (AP mode default). Replace with your static/DHCP IP in client mode.
+
+When authentication is enabled, add `-H "X-API-Key: YOUR_KEY"` to every request, or use a session cookie obtained from `/auth/login`.
+
+---
+
+### Users
+
+#### List users
+Paginated — 50 users per page by default.
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `offset` | `0` | Skip N users |
+| `limit` | `50` | Results per page (max 100) |
+
+```bash
+# First page
+curl "http://192.168.4.1/users"
+
+# Second page (e.g. 200 users total)
+curl "http://192.168.4.1/users?offset=50&limit=50"
+
+# With API key
+curl -H "X-API-Key: YOUR_KEY" "http://192.168.4.1/users?offset=0&limit=50"
+```
+
+Response:
+```json
+{"users":[{"uid":"D7EE4C06","name":"Ali","relay1":true,"relay2":false}],"total":200,"offset":0,"limit":50}
+```
+
+#### Add user
+```bash
+curl -X POST "http://192.168.4.1/users" \
+  -d "uid=D7EE4C06&name=Ali&relay1=1&relay2=0"
+```
+
+#### Delete user
+```bash
+curl -X DELETE "http://192.168.4.1/users?uid=D7EE4C06"
+```
+
+---
+
+### Logs
+
+#### List recent logs (RAM, last 50)
+```bash
+curl "http://192.168.4.1/logs"
+```
+
+#### Clear RAM logs
+```bash
+curl -X DELETE "http://192.168.4.1/logs?scope=ram"
+```
+
+#### Clear all logs (RAM + LittleFS)
+```bash
+curl -X DELETE "http://192.168.4.1/logs?scope=all"
+```
+
+#### Download full log file
+```bash
+curl "http://192.168.4.1/logs/export" -o logs.txt
+```
+
+---
+
+### RFID
+
+#### Get last scanned card
+```bash
+curl "http://192.168.4.1/rfid"
+```
+
+Response:
+```json
+{"rfid":{"reader":1,"uid":"D7EE4C06","allowed":true,"ts":12345}}
+```
+
+---
+
+### Status
+```bash
+curl "http://192.168.4.1/status"
+```
+
+---
+
+### Settings
+
+#### Get settings
+```bash
+curl "http://192.168.4.1/settings"
+```
+
+#### Set WiFi client mode
+```bash
+curl -X POST "http://192.168.4.1/settings" \
+  -d "wifi_client=1&wifi_ssid=MyNetwork&wifi_pass=MyPassword"
+```
+
+#### Set static IP
+```bash
+curl -X POST "http://192.168.4.1/settings" \
+  -d "wifi_static=1&wifi_ip=192.168.1.50&wifi_gateway=192.168.1.1&wifi_mask=255.255.255.0"
+```
+
+#### Set relay names
+```bash
+curl -X POST "http://192.168.4.1/settings" \
+  -d "relay1=KapiA&relay2=KapiB"
+```
+
+#### Enable authentication
+```bash
+curl -X POST "http://192.168.4.1/settings" \
+  -d "auth_enabled=1&auth_user=admin&auth_pass=secret"
+```
+
+Response includes `api_key` (shown once — save it):
+```json
+{"ok":true,"api_key":"3F9A..."}
+```
+
+---
+
+### Authentication
+
+#### Login (returns session cookie)
+```bash
+curl -c cookies.txt -X POST "http://192.168.4.1/auth/login" \
+  -d "user=admin&pass=secret"
+```
+
+#### Use session cookie for subsequent requests
+```bash
+curl -b cookies.txt "http://192.168.4.1/users"
+```
+
+#### Logout
+```bash
+curl -b cookies.txt -X POST "http://192.168.4.1/auth/logout"
+```
+
+---
+
+### Backup & Restore
+
+#### Download user backup
+```bash
+curl "http://192.168.4.1/backup?type=users" -o backup-users.txt
+```
+
+#### Download settings backup
+```bash
+curl "http://192.168.4.1/backup?type=settings" -o backup-settings.txt
+```
+
+#### Download full backup (users + settings)
+```bash
+curl "http://192.168.4.1/backup?type=full" -o backup-full.txt
+```
+
+#### Restore from backup file
+```bash
+curl -X POST "http://192.168.4.1/restore" \
+  -H "Content-Type: text/plain" \
+  --data-binary @backup-full.txt
+```
+
+---
+
+### RTC
+
+#### Read current RTC time
+```bash
+curl "http://192.168.4.1/rtc"
+```
+
+#### Set RTC time
+```bash
+curl -X POST "http://192.168.4.1/rtc" \
+  -d "datetime=2025-05-10T14:30:00"
+```
+
+---
+
+### Maintenance
+
+#### Pulse relay (momentary activation)
+```bash
+# Relay 1, default duration (600 ms)
+curl -X POST "http://192.168.4.1/maintenance/relay" \
+  -d "relay=1&action=pulse"
+
+# Relay 2, custom duration
+curl -X POST "http://192.168.4.1/maintenance/relay" \
+  -d "relay=2&action=pulse&duration_ms=1000"
+```
+
+#### Set relay state (manual on/off)
+```bash
+curl -X POST "http://192.168.4.1/maintenance/relay" \
+  -d "relay=1&action=on"
+
+curl -X POST "http://192.168.4.1/maintenance/relay" \
+  -d "relay=1&action=off"
+```
+
+#### UART link test (ESP32 <-> Nano ping)
+```bash
+curl -X POST "http://192.168.4.1/maintenance/uart-test"
+```
+
+#### Reader feedback test (LED + beep)
+```bash
+# Allow signal on reader 1
+curl -X POST "http://192.168.4.1/maintenance/reader-test" \
+  -d "reader=1&action=allow"
+
+# Deny signal on reader 2
+curl -X POST "http://192.168.4.1/maintenance/reader-test" \
+  -d "reader=2&action=deny"
+```
+
+#### Format LittleFS (erases all data)
+```bash
+curl -X POST "http://192.168.4.1/maintenance/format"
+```
+
+#### Reboot device
+```bash
+curl -X POST "http://192.168.4.1/maintenance/reboot"
+```
 
 ## Maintenance Tests
 - Reader test (allow/deny) triggers LED/BEEP feedback for each reader.
