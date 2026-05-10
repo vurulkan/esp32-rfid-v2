@@ -142,7 +142,27 @@ LED/BEEP lines are active-low (pull to GND to trigger).
 1. Install ESP32 core (2.0.17 recommended).
 2. Open `src/esp32-rfid` as the sketch folder.
 3. Board: `ESP32 Dev Module`, select your port.
-4. Upload and open Serial Monitor at 115200.
+4. **Tools → Partition Scheme → Default 4MB with spiffs** (required for OTA support).
+5. Upload and open Serial Monitor at 115200.
+
+## Exporting Firmware Binary (for OTA)
+
+To get a `.bin` file for web-based OTA update:
+
+**Sketch → Export Compiled Binary** (`Ctrl + Alt + S`)
+
+Arduino IDE compiles and places the output in the sketch's `build/` folder:
+
+```
+src/esp32-rfid/
+└── build/
+    └── esp32.esp32.esp32/
+        ├── esp32-rfid.ino.bin           ← upload this via web UI
+        ├── esp32-rfid.ino.bootloader.bin
+        └── esp32-rfid.ino.partitions.bin
+```
+
+Only `esp32-rfid.ino.bin` is needed for OTA. The bootloader and partition files are not required.
 
 ## Nano Firmware
 - Wiegand bridge firmware is in `nano/wiegand_nano/wiegand_nano.ino`.
@@ -390,6 +410,26 @@ curl -X POST "http://192.168.4.1/maintenance/format"
 #### Reboot device
 ```bash
 curl -X POST "http://192.168.4.1/maintenance/reboot"
+```
+
+---
+
+### Firmware Update (OTA)
+
+Upload a new firmware binary. Device reboots automatically after a successful update.
+
+> **Requires OTA-compatible partition scheme** (e.g. Default 4MB with SPIFFS/LittleFS).
+> Select via Arduino IDE: **Tools → Partition Scheme → Default 4MB with spiffs**.
+
+```bash
+curl -X POST "http://192.168.4.1/firmware" \
+  -H "X-API-Key: YOUR_KEY" \
+  -F "firmware=@esp32-rfid.ino.bin"
+```
+
+Response on success (device reboots immediately after):
+```json
+{"ok":true}
 ```
 
 ## Maintenance Tests

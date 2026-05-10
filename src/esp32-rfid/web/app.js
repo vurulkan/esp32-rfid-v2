@@ -784,3 +784,65 @@ setInterval(() => {
 window.addEventListener('beforeunload', () => {
   clearApiKey();
 });
+
+document.getElementById('firmware-upload').addEventListener('click', () => {
+  const fileInput = document.getElementById('firmware-file');
+  const status = document.getElementById('firmware-status');
+  const progressWrap = document.getElementById('firmware-progress');
+  const bar = document.getElementById('firmware-bar');
+  const pct = document.getElementById('firmware-pct');
+
+  if (!fileInput.files || fileInput.files.length === 0) {
+    status.textContent = 'Select a .bin file first.';
+    return;
+  }
+  const file = fileInput.files[0];
+  const ok = confirm(`Upload "${file.name}" (${Math.round(file.size / 1024)} KB)?\nDevice will reboot after update.`);
+  if (!ok) {
+    return;
+  }
+
+  progressWrap.classList.remove('is-hidden');
+  bar.style.width = '0%';
+  pct.textContent = '0%';
+  status.textContent = 'Uploading...';
+
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/firmware');
+  xhr.withCredentials = true;
+
+  xhr.upload.addEventListener('progress', (e) => {
+    if (e.lengthComputable) {
+      const p = Math.round((e.loaded / e.total) * 100);
+      bar.style.width = p + '%';
+      pct.textContent = p + '%';
+      status.textContent = 'Uploading... ' + p + '%';
+    }
+  });
+
+  xhr.addEventListener('load', () => {
+    try {
+      const payload = JSON.parse(xhr.responseText);
+      if (payload.ok) {
+        bar.style.width = '100%';
+        pct.textContent = '100%';
+        status.textContent = 'Update successful. Device is rebooting...';
+      } else {
+        status.textContent = 'Update failed.';
+        progressWrap.classList.add('is-hidden');
+      }
+    } catch (err) {
+      status.textContent = 'Update failed.';
+      progressWrap.classList.add('is-hidden');
+    }
+  });
+
+  xhr.addEventListener('error', () => {
+    status.textContent = 'Connection error.';
+    progressWrap.classList.add('is-hidden');
+  });
+
+  const formData = new FormData();
+  formData.append('firmware', file);
+  xhr.send(formData);
+});

@@ -244,6 +244,20 @@
         </div>
       </div>
       <div class="card">
+        <div class="card-title">FIRMWARE UPDATE (OTA)</div>
+        <label>Firmware binary (.bin)
+          <input type="file" id="firmware-file" accept=".bin">
+        </label>
+        <button id="firmware-upload">Upload Firmware</button>
+        <div id="firmware-status" class="hint"></div>
+        <div id="firmware-progress" class="is-hidden" style="margin-top:10px">
+          <div class="bar">
+            <div class="bar-fill" id="firmware-bar" style="transition:width 0.3s ease"></div>
+          </div>
+          <div class="metric-value" id="firmware-pct" style="margin-top:4px">0%</div>
+        </div>
+      </div>
+      <div class="card">
         <div class="card-title">LITTLEFS</div>
         <button id="format-fs">Format LittleFS</button>
       </div>

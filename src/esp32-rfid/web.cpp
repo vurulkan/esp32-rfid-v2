@@ -3,6 +3,7 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <LittleFS.h>
+#include <Update.h>
 #include <esp_system.h>
 #include <cstring>
 
@@ -1092,6 +1093,47 @@ void web_task(void* param) {
       server.send(500, "application/json", "{\"ok\":false}");
     }
   });
+
+  server.on("/firmware", HTTP_POST,
+    [&]() {
+      if (!check_auth(server)) {
+        send_unauthorized(server, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
+        return;
+      }
+      bool ok = !Update.hasError();
+      server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+      if (ok) {
+        delay(200);
+        ESP.restart();
+      }
+    },
+    [&]() {
+      if (!check_auth(server)) {
+        return;
+      }
+      HTTPUpload& upload = server.upload();
+      if (upload.status == UPLOAD_FILE_START) {
+        Serial.printf("OTA start: %s\n", upload.filename.c_str());
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+          Serial.println("OTA begin failed");
+        }
+      } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (Update.isRunning()) {
+          if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+            Serial.println("OTA write error");
+          }
+        }
+      } else if (upload.status == UPLOAD_FILE_END) {
+        if (Update.isRunning()) {
+          if (Update.end(true)) {
+            Serial.printf("OTA done: %u bytes\n", upload.totalSize);
+          } else {
+            Serial.println("OTA end failed");
+          }
+        }
+      }
+    }
+  );
 
   server.onNotFound([&]() {
     Serial.printf("HTTP 404 %s\n", server.uri().c_str());

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python pack_web.py)",
+      "Bash(python -c ' *)"
+    ]
+  }
+}
