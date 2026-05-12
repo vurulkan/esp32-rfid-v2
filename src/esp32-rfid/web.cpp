@@ -625,8 +625,17 @@ void web_task(void* param) {
       send_unauthorized(server, "text/plain", "unauthorized");
       return;
     }
-    String data = read_file_or_empty("/logs.txt");
-    server.send(200, "text/plain", data);
+    if (!LittleFS.begin() || !LittleFS.exists("/logs.txt")) {
+      server.send(200, "text/plain", "");
+      return;
+    }
+    File file = LittleFS.open("/logs.txt", FILE_READ);
+    if (!file) {
+      server.send(500, "text/plain", "");
+      return;
+    }
+    server.streamFile(file, "text/plain");
+    file.close();
   });
 
   server.on("/rfid", HTTP_GET, [&]() {
