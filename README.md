@@ -131,29 +131,32 @@ LED/BEEP lines are active-low (pull to GND to trigger).
 - Optional static IP for client mode is persisted
 - Relay names are persisted (defaults: `Relay 1`, `Relay 2`)
 - Relay manual on/off states are persisted
+- Relay pulse duration is persisted (default: `600` ms, range: `50-10000` ms)
 - Authentication settings are persisted (username, password, API key)
 
 ## Backup & Restore
-- `GET /backup?type=users|settings` returns plain text
+- `GET /backup?type=users|settings|full` returns plain text
 - `POST /restore` with plain text body (auto-detects settings/users sections)
 - Logs can be downloaded via `/logs/export`
 
 ## Configurable Constants
 
-These values can be changed before compiling:
+Most device behavior is configured from the web UI or REST API. These values are compile-time defaults or limits:
 
 | Constant | File | Default | Description |
 | --- | --- | --- | --- |
-| `kRelayPulseMs` | `src/esp32-rfid/logic.cpp` | `600` | Relay activation duration on card read (ms) |
+| `kDefaultRelayPulseMs` | `src/esp32-rfid/settings.h` | `600` | Default relay activation duration on card read (ms) |
+| `kMinRelayPulseMs` | `src/esp32-rfid/settings.h` | `50` | Minimum allowed relay pulse duration (ms) |
+| `kMaxRelayPulseMs` | `src/esp32-rfid/settings.h` | `10000` | Maximum allowed relay pulse duration (ms) |
 | `kMaxFileLogs` | `src/esp32-rfid/log.cpp` | `10000` | Maximum log entries stored in LittleFS |
 
-**Example — change relay pulse to 1 second:**
-```cpp
-// logic.cpp
-constexpr uint32_t kRelayPulseMs = 1000;
+Relay pulse duration can be changed without recompiling from Settings -> Relay Pulse, or with the REST API:
+```bash
+curl -X POST "http://192.168.4.1/settings" \
+  -d "relay_pulse_ms=1000"
 ```
 
-**Example — increase log limit to 50,000:**
+**Example - increase log limit to 50,000:**
 ```cpp
 // log.cpp
 constexpr size_t kMaxFileLogs = 50000;
@@ -161,30 +164,30 @@ constexpr size_t kMaxFileLogs = 50000;
 
 > **Note on `kMaxFileLogs`:** The default 4MB partition gives LittleFS approximately 1.5 MB. At ~70 bytes per log entry (with RTC), the physical ceiling is around 21,000 entries. Trim requires free space to write a temporary file, so if LittleFS fills up the trim cannot run and new entries will silently stop being written. Keep `kMaxFileLogs` at or below **~15,000** to stay safely within the filesystem capacity.
 
-Recompile and upload after any change.
+Recompile and upload after changing compile-time constants.
 
 ## Build & Upload (Arduino IDE)
 1. Install ESP32 core (2.0.17 recommended).
 2. Open `src/esp32-rfid` as the sketch folder.
 3. Board: `ESP32 Dev Module`, select your port.
-4. **Tools → Partition Scheme → Default 4MB with spiffs** (required for OTA support).
+4. **Tools -> Partition Scheme -> Default 4MB with spiffs** (required for OTA support).
 5. Upload and open Serial Monitor at 115200.
 
 ## Exporting Firmware Binary (for OTA)
 
 To get a `.bin` file for web-based OTA update:
 
-**Sketch → Export Compiled Binary** (`Ctrl + Alt + S`)
+**Sketch -> Export Compiled Binary** (`Ctrl + Alt + S`)
 
 Arduino IDE compiles and places the output in the sketch's `build/` folder:
 
 ```
 src/esp32-rfid/
-└── build/
-    └── esp32.esp32.esp32/
-        ├── esp32-rfid.ino.bin           ← upload this via web UI
-        ├── esp32-rfid.ino.bootloader.bin
-        └── esp32-rfid.ino.partitions.bin
+`-- build/
+    `-- esp32.esp32.esp32/
+        |-- esp32-rfid.ino.bin           <- upload this via web UI
+        |-- esp32-rfid.ino.bootloader.bin
+        `-- esp32-rfid.ino.partitions.bin
 ```
 
 Only `esp32-rfid.ino.bin` is needed for OTA. The bootloader and partition files are not required.
@@ -209,7 +212,7 @@ When authentication is enabled, add `-H "X-API-Key: YOUR_KEY"` to every request,
 ### Users
 
 #### List users
-Paginated — 50 users per page by default.
+Paginated - 50 users per page by default.
 
 | Parameter | Default | Description |
 | --- | --- | --- |
@@ -297,6 +300,11 @@ curl "http://192.168.4.1/status"
 curl "http://192.168.4.1/settings"
 ```
 
+Response includes persisted relay pulse duration:
+```json
+{"relay_pulse_ms":600}
+```
+
 #### Set WiFi client mode
 ```bash
 curl -X POST "http://192.168.4.1/settings" \
@@ -315,13 +323,20 @@ curl -X POST "http://192.168.4.1/settings" \
   -d "relay1=KapiA&relay2=KapiB"
 ```
 
+#### Set card-read relay pulse duration
+Relay pulse duration is used when an authorized card is read. Values outside `50-10000` ms are clamped.
+```bash
+curl -X POST "http://192.168.4.1/settings" \
+  -d "relay_pulse_ms=1000"
+```
+
 #### Enable authentication
 ```bash
 curl -X POST "http://192.168.4.1/settings" \
   -d "auth_enabled=1&auth_user=admin&auth_pass=secret"
 ```
 
-Response includes `api_key` (shown once — save it):
+Response includes `api_key` (shown once - save it):
 ```json
 {"ok":true,"api_key":"3F9A..."}
 ```
@@ -393,11 +408,11 @@ curl -X POST "http://192.168.4.1/rtc" \
 
 #### Pulse relay (momentary activation)
 ```bash
-# Relay 1, default duration (600 ms)
+# Relay 1, configured default duration (600 ms on clean install)
 curl -X POST "http://192.168.4.1/maintenance/relay" \
   -d "relay=1&action=pulse"
 
-# Relay 2, custom duration
+# Relay 2, custom one-time duration
 curl -X POST "http://192.168.4.1/maintenance/relay" \
   -d "relay=2&action=pulse&duration_ms=1000"
 ```
@@ -444,7 +459,7 @@ curl -X POST "http://192.168.4.1/maintenance/reboot"
 Upload a new firmware binary. Device reboots automatically after a successful update.
 
 > **Requires OTA-compatible partition scheme** (e.g. Default 4MB with SPIFFS/LittleFS).
-> Select via Arduino IDE: **Tools → Partition Scheme → Default 4MB with spiffs**.
+> Select via Arduino IDE: **Tools -> Partition Scheme -> Default 4MB with spiffs**.
 
 ```bash
 curl -X POST "http://192.168.4.1/firmware" \

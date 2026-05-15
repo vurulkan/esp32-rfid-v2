@@ -262,6 +262,8 @@ String settings_to_text() {
   out += settings.relay1_state ? "1" : "0";
   out += "\nrelay2_state=";
   out += settings.relay2_state ? "1" : "0";
+  out += "\nrelay_pulse_ms=";
+  out += settings.relay_pulse_ms;
   out += "\nauth_enabled=";
   out += settings.auth_enabled ? "1" : "0";
   out += "\nauth_user=";
@@ -340,6 +342,17 @@ bool apply_settings_text(const String& text) {
       String value = line.substring(13);
       value.trim();
       settings.relay2_state = (value == "1" || value == "true" || value == "yes");
+    } else if (line.startsWith("relay_pulse_ms=")) {
+      String value = line.substring(15);
+      value.trim();
+      long parsed = value.toInt();
+      uint32_t duration = parsed > 0 ? static_cast<uint32_t>(parsed) : 0;
+      if (duration < kMinRelayPulseMs) {
+        duration = kMinRelayPulseMs;
+      } else if (duration > kMaxRelayPulseMs) {
+        duration = kMaxRelayPulseMs;
+      }
+      settings.relay_pulse_ms = duration;
     } else if (line.startsWith("auth_enabled=")) {
       String value = line.substring(13);
       value.trim();
@@ -369,6 +382,7 @@ bool apply_settings_text(const String& text) {
   settings_set_relay_names(settings.relay1_name, settings.relay2_name);
   settings_set_relay_state(1, settings.relay1_state);
   settings_set_relay_state(2, settings.relay2_state);
+  settings_set_relay_pulse_ms(settings.relay_pulse_ms);
   settings_set_auth(settings.auth_enabled, settings.auth_user, settings.auth_pass, settings.api_key);
   rtc_init(settings.rtc_enabled);
   rtc_set_time_valid(settings.rtc_time_valid);
@@ -827,6 +841,8 @@ void web_task(void* param) {
       json += settings.relay1_state ? "true" : "false";
       json += ",\"relay2_state\":";
       json += settings.relay2_state ? "true" : "false";
+      json += ",\"relay_pulse_ms\":";
+      json += settings.relay_pulse_ms;
       json += ",\"auth_enabled\":";
       json += settings.auth_enabled ? "true" : "false";
       json += ",\"auth_user\":\"";
@@ -885,6 +901,11 @@ void web_task(void* param) {
       }
       if (server.hasArg("relay1") || server.hasArg("relay2")) {
         settings_set_relay_names(relay1.c_str(), relay2.c_str());
+      }
+      if (server.hasArg("relay_pulse_ms")) {
+        long parsed = server.arg("relay_pulse_ms").toInt();
+        uint32_t duration = parsed > 0 ? static_cast<uint32_t>(parsed) : 0;
+        settings_set_relay_pulse_ms(duration);
       }
       if (server.hasArg("auth_enabled")) {
         auto current_auth = settings_get();
@@ -1087,11 +1108,12 @@ void web_task(void* param) {
       req.payload.trigger_relay.relay_id = relay_id;
       uint32_t duration = 0;
       if (server.hasArg("duration_ms")) {
-        duration = static_cast<uint32_t>(server.arg("duration_ms").toInt());
-        if (duration < 50) {
-          duration = 50;
-        } else if (duration > 10000) {
-          duration = 10000;
+        long parsed = server.arg("duration_ms").toInt();
+        duration = parsed > 0 ? static_cast<uint32_t>(parsed) : 0;
+        if (duration < kMinRelayPulseMs) {
+          duration = kMinRelayPulseMs;
+        } else if (duration > kMaxRelayPulseMs) {
+          duration = kMaxRelayPulseMs;
         }
       }
       req.payload.trigger_relay.duration_ms = duration;

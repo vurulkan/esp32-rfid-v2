@@ -15,8 +15,6 @@
 namespace app {
 
 namespace {
-constexpr uint32_t kRelayPulseMs = 600;
-
 struct LastRfidState {
   uint8_t reader_id = 0;
   char uid[kUidMaxLen] = {0};
@@ -159,7 +157,7 @@ void logic_task(void* param) {
         }
 
         if (allowed) {
-          relay_activate(relay_id, kRelayPulseMs);
+          relay_activate(relay_id, settings_get().relay_pulse_ms);
         }
 
         logs.add(log_msg, last_rfid.ts_ms);
@@ -242,7 +240,7 @@ void logic_task(void* param) {
           if (relay_id == 1 || relay_id == 2) {
             uint32_t duration = req.payload.trigger_relay.duration_ms;
             if (duration == 0) {
-              duration = kRelayPulseMs;
+              duration = settings_get().relay_pulse_ms;
             }
             relay_activate(relay_id, duration);
             send_response_cstr(req.reply_queue, true, "{\"ok\":true}");

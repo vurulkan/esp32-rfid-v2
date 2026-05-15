@@ -7,7 +7,18 @@ namespace app {
 
 namespace {
 constexpr const char* kSettingsPath = "/settings.txt";
-Settings g_settings{false, false, false, "", "", false, "", "", "", "Relay 1", "Relay 2", false, false, false, "", "", ""};
+Settings g_settings{false, false, false, "", "", false, "", "", "", "Relay 1", "Relay 2", false, false,
+                    kDefaultRelayPulseMs, false, "", "", ""};
+
+uint32_t clamp_relay_pulse_ms(uint32_t duration_ms) {
+  if (duration_ms < kMinRelayPulseMs) {
+    return kMinRelayPulseMs;
+  }
+  if (duration_ms > kMaxRelayPulseMs) {
+    return kMaxRelayPulseMs;
+  }
+  return duration_ms;
+}
 } // namespace
 
 void settings_init() {
@@ -26,6 +37,7 @@ void settings_init() {
   g_settings.relay2_name[sizeof(g_settings.relay2_name) - 1] = '\0';
   g_settings.relay1_state = false;
   g_settings.relay2_state = false;
+  g_settings.relay_pulse_ms = kDefaultRelayPulseMs;
   g_settings.auth_enabled = false;
   g_settings.auth_user[0] = '\0';
   g_settings.auth_pass[0] = '\0';
@@ -112,6 +124,12 @@ bool settings_load() {
       value.trim();
       g_settings.relay2_state = (value == "1" || value == "true" || value == "yes");
     }
+    if (line.startsWith("relay_pulse_ms=")) {
+      String value = line.substring(15);
+      value.trim();
+      long duration = value.toInt();
+      g_settings.relay_pulse_ms = clamp_relay_pulse_ms(duration > 0 ? static_cast<uint32_t>(duration) : 0);
+    }
     if (line.startsWith("auth_enabled=")) {
       String value = line.substring(13);
       value.trim();
@@ -171,6 +189,8 @@ bool settings_save() {
   file.println(g_settings.relay1_state ? "1" : "0");
   file.print("relay2_state=");
   file.println(g_settings.relay2_state ? "1" : "0");
+  file.print("relay_pulse_ms=");
+  file.println(g_settings.relay_pulse_ms);
   file.print("auth_enabled=");
   file.println(g_settings.auth_enabled ? "1" : "0");
   file.print("auth_user=");
@@ -247,6 +267,11 @@ bool settings_set_relay_state(uint8_t relay_id, bool enabled) {
   } else {
     return false;
   }
+  return settings_save();
+}
+
+bool settings_set_relay_pulse_ms(uint32_t duration_ms) {
+  g_settings.relay_pulse_ms = clamp_relay_pulse_ms(duration_ms);
   return settings_save();
 }
 

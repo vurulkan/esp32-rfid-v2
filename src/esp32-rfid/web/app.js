@@ -174,6 +174,15 @@ async function loadSettings() {
   if (relay2Toggle) {
     relay2Toggle.checked = !!data.relay2_state;
   }
+  const relayPulseMs = data.relay_pulse_ms || 600;
+  const cardRelayPulseInput = document.getElementById('card-relay-pulse-ms');
+  if (cardRelayPulseInput) {
+    cardRelayPulseInput.value = relayPulseMs;
+  }
+  const maintenancePulseInput = document.getElementById('relay-pulse-ms');
+  if (maintenancePulseInput) {
+    maintenancePulseInput.value = relayPulseMs;
+  }
   setWifiClientVisible(wifiClient);
   setWifiStaticVisible(!!data.wifi_static);
   document.getElementById('auth-enabled').checked = !!data.auth_enabled;
@@ -239,8 +248,8 @@ function setAuthFieldsVisible(enabled) {
   }
 }
 
-function getPulseDuration() {
-  const input = document.getElementById('relay-pulse-ms');
+function getPulseDuration(inputId = 'relay-pulse-ms') {
+  const input = document.getElementById(inputId);
   if (!input) {
     return '600';
   }
@@ -578,6 +587,23 @@ document.getElementById('save-relay-names').addEventListener('click', async () =
     await loadSettings();
   } catch (err) {
     alert('Failed to save relay names.');
+  }
+});
+
+document.getElementById('save-relay-pulse').addEventListener('click', async () => {
+  const duration = getPulseDuration('card-relay-pulse-ms');
+  const params = new URLSearchParams();
+  params.set('relay_pulse_ms', duration);
+  try {
+    await fetchWithAuth('/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString()
+    });
+    alert('Relay pulse saved.');
+    await loadSettings();
+  } catch (err) {
+    alert('Failed to save relay pulse.');
   }
 });
 
