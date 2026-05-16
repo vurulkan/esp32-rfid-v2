@@ -15,8 +15,6 @@
 namespace app {
 
 namespace {
-constexpr uint32_t kRelayPulseMs = 600;
-
 struct LastRfidState {
   uint8_t reader_id = 0;
   char uid[kUidMaxLen] = {0};
@@ -154,15 +152,15 @@ void logic_task(void* param) {
         } else {
           snprintf(log_msg, sizeof(log_msg), "%s", base_msg);
         }
-        logs.add(log_msg, last_rfid.ts_ms);
-        
         if (!allowed) {
           send_uart_feedback(queues, relay_id, false);
         }
 
         if (allowed) {
-          relay_activate(relay_id, kRelayPulseMs);
+          relay_activate(relay_id, settings_get().relay_pulse_ms);
         }
+
+        logs.add(log_msg, last_rfid.ts_ms);
       }
       continue;
     }
@@ -175,7 +173,13 @@ void logic_task(void* param) {
 
       switch (req.type) {
         case LogicRequestType::GetUsers: {
-          String json = users.to_json();
+          size_t offset = req.payload.get_users.offset;
+          size_t limit = req.payload.get_users.limit;
+          if (limit == 0 || limit > 100) {
+            limit = 50;
+          }
+          size_t total = 0;
+          String json = users.to_json_page(offset, limit, total);
           send_response(req.reply_queue, true, json);
           break;
         }
@@ -236,7 +240,7 @@ void logic_task(void* param) {
           if (relay_id == 1 || relay_id == 2) {
             uint32_t duration = req.payload.trigger_relay.duration_ms;
             if (duration == 0) {
-              duration = kRelayPulseMs;
+              duration = settings_get().relay_pulse_ms;
             }
             relay_activate(relay_id, duration);
             send_response_cstr(req.reply_queue, true, "{\"ok\":true}");

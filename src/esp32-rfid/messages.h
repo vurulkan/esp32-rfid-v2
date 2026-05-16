@@ -59,6 +59,10 @@ struct LogicRequest {
       uint8_t relay_id;
       uint8_t enabled;
     } relay_state;
+    struct {
+      uint16_t offset;
+      uint16_t limit;
+    } get_users;
   } payload;
 };
 

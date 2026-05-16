@@ -131,18 +131,66 @@ LED/BEEP lines are active-low (pull to GND to trigger).
 - Optional static IP for client mode is persisted
 - Relay names are persisted (defaults: `Relay 1`, `Relay 2`)
 - Relay manual on/off states are persisted
+- Relay pulse duration is persisted (default: `600` ms, range: `50-10000` ms)
 - Authentication settings are persisted (username, password, API key)
 
 ## Backup & Restore
-- `GET /backup?type=users|settings` returns plain text
+- `GET /backup?type=users|settings|full` returns plain text
 - `POST /restore` with plain text body (auto-detects settings/users sections)
 - Logs can be downloaded via `/logs/export`
+
+## Configurable Constants
+
+Most device behavior is configured from the web UI or REST API. These values are compile-time defaults or limits:
+
+| Constant | File | Default | Description |
+| --- | --- | --- | --- |
+| `kDefaultRelayPulseMs` | `src/esp32-rfid/settings.h` | `600` | Default relay activation duration on card read (ms) |
+| `kMinRelayPulseMs` | `src/esp32-rfid/settings.h` | `50` | Minimum allowed relay pulse duration (ms) |
+| `kMaxRelayPulseMs` | `src/esp32-rfid/settings.h` | `10000` | Maximum allowed relay pulse duration (ms) |
+| `kMaxFileLogs` | `src/esp32-rfid/log.cpp` | `10000` | Maximum log entries stored in LittleFS |
+
+Relay pulse duration can be changed without recompiling from Settings -> Relay Pulse, or with the REST API:
+```bash
+curl -X POST "http://192.168.4.1/settings" \
+  -d "relay_pulse_ms=1000"
+```
+
+**Example - increase log limit to 50,000:**
+```cpp
+// log.cpp
+constexpr size_t kMaxFileLogs = 50000;
+```
+
+> **Note on `kMaxFileLogs`:** The default 4MB partition gives LittleFS approximately 1.5 MB. At ~70 bytes per log entry (with RTC), the physical ceiling is around 21,000 entries. Trim requires free space to write a temporary file, so if LittleFS fills up the trim cannot run and new entries will silently stop being written. Keep `kMaxFileLogs` at or below **~15,000** to stay safely within the filesystem capacity.
+
+Recompile and upload after changing compile-time constants.
 
 ## Build & Upload (Arduino IDE)
 1. Install ESP32 core (2.0.17 recommended).
 2. Open `src/esp32-rfid` as the sketch folder.
 3. Board: `ESP32 Dev Module`, select your port.
-4. Upload and open Serial Monitor at 115200.
+4. **Tools -> Partition Scheme -> Default 4MB with spiffs** (required for OTA support).
+5. Upload and open Serial Monitor at 115200.
+
+## Exporting Firmware Binary (for OTA)
+
+To get a `.bin` file for web-based OTA update:
+
+**Sketch -> Export Compiled Binary** (`Ctrl + Alt + S`)
+
+Arduino IDE compiles and places the output in the sketch's `build/` folder:
+
+```
+src/esp32-rfid/
+`-- build/
+    `-- esp32.esp32.esp32/
+        |-- esp32-rfid.ino.bin           <- upload this via web UI
+        |-- esp32-rfid.ino.bootloader.bin
+        `-- esp32-rfid.ino.partitions.bin
+```
+
+Only `esp32-rfid.ino.bin` is needed for OTA. The bootloader and partition files are not required.
 
 ## Nano Firmware
 - Wiegand bridge firmware is in `nano/wiegand_nano/wiegand_nano.ino`.
@@ -154,26 +202,275 @@ LED/BEEP lines are active-low (pull to GND to trigger).
 - If you see LittleFS mount errors on first boot, format it via Maintenance -> "Format LittleFS" or hold IO0 for 10+ seconds.
 
 ## REST API
-- `GET /` UI (gzip)
-- `GET /login` Login page (gzip)
-- `GET /app.js`, `GET /style.css` (gzip)
-- `GET /users`
-- `POST /users` (uid, name, relay1, relay2)
-- `DELETE /users` (uid)
-- `GET /logs`
-- `DELETE /logs?scope=ram|all`
-- `GET /logs/export`
-- `GET /rfid`
-- `GET /status`
-- `GET /backup?type=users|settings`
-- `POST /restore`
-- `POST /auth/login`
-- `POST /auth/logout`
-- `POST /maintenance/format`
-- `POST /maintenance/uart-test`
-- `POST /maintenance/reader-test` (reader=1|2, action=allow|deny)
-- `POST /maintenance/relay` (relay=1|2, action=pulse|on|off, duration_ms=50..10000)
-- `POST /maintenance/reboot`
+
+Base URL: `http://192.168.4.1` (AP mode default). Replace with your static/DHCP IP in client mode.
+
+When authentication is enabled, add `-H "X-API-Key: YOUR_KEY"` to every request, or use a session cookie obtained from `/auth/login`.
+
+---
+
+### Users
+
+#### List users
+Paginated - 50 users per page by default.
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `offset` | `0` | Skip N users |
+| `limit` | `50` | Results per page (max 100) |
+
+```bash
+# First page
+curl "http://192.168.4.1/users"
+
+# Second page (e.g. 200 users total)
+curl "http://192.168.4.1/users?offset=50&limit=50"
+
+# With API key
+curl -H "X-API-Key: YOUR_KEY" "http://192.168.4.1/users?offset=0&limit=50"
+```
+
+Response:
+```json
+{"users":[{"uid":"D7EE4C06","name":"Ali","relay1":true,"relay2":false}],"total":200,"offset":0,"limit":50}
+```
+
+#### Add user
+```bash
+curl -X POST "http://192.168.4.1/users" \
+  -d "uid=D7EE4C06&name=Ali&relay1=1&relay2=0"
+```
+
+#### Delete user
+```bash
+curl -X DELETE "http://192.168.4.1/users?uid=D7EE4C06"
+```
+
+---
+
+### Logs
+
+#### List recent logs (RAM, last 50)
+```bash
+curl "http://192.168.4.1/logs"
+```
+
+#### Clear RAM logs
+```bash
+curl -X DELETE "http://192.168.4.1/logs?scope=ram"
+```
+
+#### Clear all logs (RAM + LittleFS)
+```bash
+curl -X DELETE "http://192.168.4.1/logs?scope=all"
+```
+
+#### Download full log file
+```bash
+curl "http://192.168.4.1/logs/export" -o logs.txt
+```
+
+---
+
+### RFID
+
+#### Get last scanned card
+```bash
+curl "http://192.168.4.1/rfid"
+```
+
+Response:
+```json
+{"rfid":{"reader":1,"uid":"D7EE4C06","allowed":true,"ts":12345}}
+```
+
+---
+
+### Status
+```bash
+curl "http://192.168.4.1/status"
+```
+
+---
+
+### Settings
+
+#### Get settings
+```bash
+curl "http://192.168.4.1/settings"
+```
+
+Response includes persisted relay pulse duration:
+```json
+{"relay_pulse_ms":600}
+```
+
+#### Set WiFi client mode
+```bash
+curl -X POST "http://192.168.4.1/settings" \
+  -d "wifi_client=1&wifi_ssid=MyNetwork&wifi_pass=MyPassword"
+```
+
+#### Set static IP
+```bash
+curl -X POST "http://192.168.4.1/settings" \
+  -d "wifi_static=1&wifi_ip=192.168.1.50&wifi_gateway=192.168.1.1&wifi_mask=255.255.255.0"
+```
+
+#### Set relay names
+```bash
+curl -X POST "http://192.168.4.1/settings" \
+  -d "relay1=KapiA&relay2=KapiB"
+```
+
+#### Set card-read relay pulse duration
+Relay pulse duration is used when an authorized card is read. Values outside `50-10000` ms are clamped.
+```bash
+curl -X POST "http://192.168.4.1/settings" \
+  -d "relay_pulse_ms=1000"
+```
+
+#### Enable authentication
+```bash
+curl -X POST "http://192.168.4.1/settings" \
+  -d "auth_enabled=1&auth_user=admin&auth_pass=secret"
+```
+
+Response includes `api_key` (shown once - save it):
+```json
+{"ok":true,"api_key":"3F9A..."}
+```
+
+---
+
+### Authentication
+
+#### Login (returns session cookie)
+```bash
+curl -c cookies.txt -X POST "http://192.168.4.1/auth/login" \
+  -d "user=admin&pass=secret"
+```
+
+#### Use session cookie for subsequent requests
+```bash
+curl -b cookies.txt "http://192.168.4.1/users"
+```
+
+#### Logout
+```bash
+curl -b cookies.txt -X POST "http://192.168.4.1/auth/logout"
+```
+
+---
+
+### Backup & Restore
+
+#### Download user backup
+```bash
+curl "http://192.168.4.1/backup?type=users" -o backup-users.txt
+```
+
+#### Download settings backup
+```bash
+curl "http://192.168.4.1/backup?type=settings" -o backup-settings.txt
+```
+
+#### Download full backup (users + settings)
+```bash
+curl "http://192.168.4.1/backup?type=full" -o backup-full.txt
+```
+
+#### Restore from backup file
+```bash
+curl -X POST "http://192.168.4.1/restore" \
+  -H "Content-Type: text/plain" \
+  --data-binary @backup-full.txt
+```
+
+---
+
+### RTC
+
+#### Read current RTC time
+```bash
+curl "http://192.168.4.1/rtc"
+```
+
+#### Set RTC time
+```bash
+curl -X POST "http://192.168.4.1/rtc" \
+  -d "datetime=2025-05-10T14:30:00"
+```
+
+---
+
+### Maintenance
+
+#### Pulse relay (momentary activation)
+```bash
+# Relay 1, configured default duration (600 ms on clean install)
+curl -X POST "http://192.168.4.1/maintenance/relay" \
+  -d "relay=1&action=pulse"
+
+# Relay 2, custom one-time duration
+curl -X POST "http://192.168.4.1/maintenance/relay" \
+  -d "relay=2&action=pulse&duration_ms=1000"
+```
+
+#### Set relay state (manual on/off)
+```bash
+curl -X POST "http://192.168.4.1/maintenance/relay" \
+  -d "relay=1&action=on"
+
+curl -X POST "http://192.168.4.1/maintenance/relay" \
+  -d "relay=1&action=off"
+```
+
+#### UART link test (ESP32 <-> Nano ping)
+```bash
+curl -X POST "http://192.168.4.1/maintenance/uart-test"
+```
+
+#### Reader feedback test (LED + beep)
+```bash
+# Allow signal on reader 1
+curl -X POST "http://192.168.4.1/maintenance/reader-test" \
+  -d "reader=1&action=allow"
+
+# Deny signal on reader 2
+curl -X POST "http://192.168.4.1/maintenance/reader-test" \
+  -d "reader=2&action=deny"
+```
+
+#### Format LittleFS (erases all data)
+```bash
+curl -X POST "http://192.168.4.1/maintenance/format"
+```
+
+#### Reboot device
+```bash
+curl -X POST "http://192.168.4.1/maintenance/reboot"
+```
+
+---
+
+### Firmware Update (OTA)
+
+Upload a new firmware binary. Device reboots automatically after a successful update.
+
+> **Requires OTA-compatible partition scheme** (e.g. Default 4MB with SPIFFS/LittleFS).
+> Select via Arduino IDE: **Tools -> Partition Scheme -> Default 4MB with spiffs**.
+
+```bash
+curl -X POST "http://192.168.4.1/firmware" \
+  -H "X-API-Key: YOUR_KEY" \
+  -F "firmware=@esp32-rfid.ino.bin"
+```
+
+Response on success (device reboots immediately after):
+```json
+{"ok":true}
+```
 
 ## Maintenance Tests
 - Reader test (allow/deny) triggers LED/BEEP feedback for each reader.

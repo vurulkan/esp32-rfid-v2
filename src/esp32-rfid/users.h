@@ -23,6 +23,7 @@ class UsersDb {
   bool authorized(const char* uid, uint8_t relay_id) const;
   bool get_user(const char* uid, UserRecord* out) const;
   String to_json() const;
+  String to_json_page(size_t offset, size_t limit, size_t& out_total) const;
   String to_text() const;
   bool import_text(const char* text);
 

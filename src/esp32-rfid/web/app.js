@@ -78,9 +78,23 @@ async function loadStatus() {
 }
 
 async function loadUsers() {
-  const data = await fetchJson('/users');
+  const limit = 50;
+  let offset = 0;
+  let allUsers = [];
+  let total = 0;
+  do {
+    const data = await fetchJson(`/users?offset=${offset}&limit=${limit}`);
+    const page = data.users || [];
+    allUsers = allUsers.concat(page);
+    total = (typeof data.total === 'number') ? data.total : allUsers.length;
+    offset += page.length;
+    if (page.length < limit) {
+      break;
+    }
+  } while (allUsers.length < total);
+
   const usersDiv = document.getElementById('users');
-  usersDiv.innerHTML = renderUsers(data.users || []);
+  usersDiv.innerHTML = renderUsers(allUsers);
   usersDiv.querySelectorAll('button[data-uid]').forEach(btn => {
     btn.addEventListener('click', async () => {
       const uid = btn.getAttribute('data-uid');
@@ -160,6 +174,15 @@ async function loadSettings() {
   if (relay2Toggle) {
     relay2Toggle.checked = !!data.relay2_state;
   }
+  const relayPulseMs = data.relay_pulse_ms || 600;
+  const cardRelayPulseInput = document.getElementById('card-relay-pulse-ms');
+  if (cardRelayPulseInput) {
+    cardRelayPulseInput.value = relayPulseMs;
+  }
+  const maintenancePulseInput = document.getElementById('relay-pulse-ms');
+  if (maintenancePulseInput) {
+    maintenancePulseInput.value = relayPulseMs;
+  }
   setWifiClientVisible(wifiClient);
   setWifiStaticVisible(!!data.wifi_static);
   document.getElementById('auth-enabled').checked = !!data.auth_enabled;
@@ -225,8 +248,8 @@ function setAuthFieldsVisible(enabled) {
   }
 }
 
-function getPulseDuration() {
-  const input = document.getElementById('relay-pulse-ms');
+function getPulseDuration(inputId = 'relay-pulse-ms') {
+  const input = document.getElementById(inputId);
   if (!input) {
     return '600';
   }
@@ -567,6 +590,23 @@ document.getElementById('save-relay-names').addEventListener('click', async () =
   }
 });
 
+document.getElementById('save-relay-pulse').addEventListener('click', async () => {
+  const duration = getPulseDuration('card-relay-pulse-ms');
+  const params = new URLSearchParams();
+  params.set('relay_pulse_ms', duration);
+  try {
+    await fetchWithAuth('/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString()
+    });
+    alert('Relay pulse saved.');
+    await loadSettings();
+  } catch (err) {
+    alert('Failed to save relay pulse.');
+  }
+});
+
 document.getElementById('trigger-relay1').addEventListener('click', async () => {
   const ok = confirm('Pulse Relay 1?');
   if (!ok) {
@@ -769,4 +809,66 @@ setInterval(() => {
 
 window.addEventListener('beforeunload', () => {
   clearApiKey();
+});
+
+document.getElementById('firmware-upload').addEventListener('click', () => {
+  const fileInput = document.getElementById('firmware-file');
+  const status = document.getElementById('firmware-status');
+  const progressWrap = document.getElementById('firmware-progress');
+  const bar = document.getElementById('firmware-bar');
+  const pct = document.getElementById('firmware-pct');
+
+  if (!fileInput.files || fileInput.files.length === 0) {
+    status.textContent = 'Select a .bin file first.';
+    return;
+  }
+  const file = fileInput.files[0];
+  const ok = confirm(`Upload "${file.name}" (${Math.round(file.size / 1024)} KB)?\nDevice will reboot after update.`);
+  if (!ok) {
+    return;
+  }
+
+  progressWrap.classList.remove('is-hidden');
+  bar.style.width = '0%';
+  pct.textContent = '0%';
+  status.textContent = 'Uploading...';
+
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/firmware');
+  xhr.withCredentials = true;
+
+  xhr.upload.addEventListener('progress', (e) => {
+    if (e.lengthComputable) {
+      const p = Math.round((e.loaded / e.total) * 100);
+      bar.style.width = p + '%';
+      pct.textContent = p + '%';
+      status.textContent = 'Uploading... ' + p + '%';
+    }
+  });
+
+  xhr.addEventListener('load', () => {
+    try {
+      const payload = JSON.parse(xhr.responseText);
+      if (payload.ok) {
+        bar.style.width = '100%';
+        pct.textContent = '100%';
+        status.textContent = 'Update successful. Device is rebooting...';
+      } else {
+        status.textContent = 'Update failed.';
+        progressWrap.classList.add('is-hidden');
+      }
+    } catch (err) {
+      status.textContent = 'Update failed.';
+      progressWrap.classList.add('is-hidden');
+    }
+  });
+
+  xhr.addEventListener('error', () => {
+    status.textContent = 'Connection error.';
+    progressWrap.classList.add('is-hidden');
+  });
+
+  const formData = new FormData();
+  formData.append('firmware', file);
+  xhr.send(formData);
 });

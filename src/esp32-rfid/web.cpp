@@ -3,6 +3,7 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <LittleFS.h>
+#include <Update.h>
 #include <esp_system.h>
 #include <cstring>
 
@@ -261,6 +262,8 @@ String settings_to_text() {
   out += settings.relay1_state ? "1" : "0";
   out += "\nrelay2_state=";
   out += settings.relay2_state ? "1" : "0";
+  out += "\nrelay_pulse_ms=";
+  out += settings.relay_pulse_ms;
   out += "\nauth_enabled=";
   out += settings.auth_enabled ? "1" : "0";
   out += "\nauth_user=";
@@ -339,6 +342,17 @@ bool apply_settings_text(const String& text) {
       String value = line.substring(13);
       value.trim();
       settings.relay2_state = (value == "1" || value == "true" || value == "yes");
+    } else if (line.startsWith("relay_pulse_ms=")) {
+      String value = line.substring(15);
+      value.trim();
+      long parsed = value.toInt();
+      uint32_t duration = parsed > 0 ? static_cast<uint32_t>(parsed) : 0;
+      if (duration < kMinRelayPulseMs) {
+        duration = kMinRelayPulseMs;
+      } else if (duration > kMaxRelayPulseMs) {
+        duration = kMaxRelayPulseMs;
+      }
+      settings.relay_pulse_ms = duration;
     } else if (line.startsWith("auth_enabled=")) {
       String value = line.substring(13);
       value.trim();
@@ -368,6 +382,7 @@ bool apply_settings_text(const String& text) {
   settings_set_relay_names(settings.relay1_name, settings.relay2_name);
   settings_set_relay_state(1, settings.relay1_state);
   settings_set_relay_state(2, settings.relay2_state);
+  settings_set_relay_pulse_ms(settings.relay_pulse_ms);
   settings_set_auth(settings.auth_enabled, settings.auth_user, settings.auth_pass, settings.api_key);
   rtc_init(settings.rtc_enabled);
   rtc_set_time_valid(settings.rtc_time_valid);
@@ -524,7 +539,14 @@ void web_task(void* param) {
     memset(&req, 0, sizeof(req));
     memset(&resp, 0, sizeof(resp));
     if (server.method() == HTTP_GET) {
+      uint16_t offset = server.hasArg("offset") ? static_cast<uint16_t>(server.arg("offset").toInt()) : 0;
+      uint16_t limit = server.hasArg("limit") ? static_cast<uint16_t>(server.arg("limit").toInt()) : 50;
+      if (limit == 0 || limit > 100) {
+        limit = 50;
+      }
       req.type = LogicRequestType::GetUsers;
+      req.payload.get_users.offset = offset;
+      req.payload.get_users.limit = limit;
       if (logic_request(queues, req, &resp, 300)) {
         server.send(200, "application/json", resp.json);
       } else {
@@ -617,8 +639,17 @@ void web_task(void* param) {
       send_unauthorized(server, "text/plain", "unauthorized");
       return;
     }
-    String data = read_file_or_empty("/logs.txt");
-    server.send(200, "text/plain", data);
+    if (!LittleFS.begin() || !LittleFS.exists("/logs.txt")) {
+      server.send(200, "text/plain", "");
+      return;
+    }
+    File file = LittleFS.open("/logs.txt", FILE_READ);
+    if (!file) {
+      server.send(500, "text/plain", "");
+      return;
+    }
+    server.streamFile(file, "text/plain");
+    file.close();
   });
 
   server.on("/rfid", HTTP_GET, [&]() {
@@ -810,6 +841,8 @@ void web_task(void* param) {
       json += settings.relay1_state ? "true" : "false";
       json += ",\"relay2_state\":";
       json += settings.relay2_state ? "true" : "false";
+      json += ",\"relay_pulse_ms\":";
+      json += settings.relay_pulse_ms;
       json += ",\"auth_enabled\":";
       json += settings.auth_enabled ? "true" : "false";
       json += ",\"auth_user\":\"";
@@ -868,6 +901,11 @@ void web_task(void* param) {
       }
       if (server.hasArg("relay1") || server.hasArg("relay2")) {
         settings_set_relay_names(relay1.c_str(), relay2.c_str());
+      }
+      if (server.hasArg("relay_pulse_ms")) {
+        long parsed = server.arg("relay_pulse_ms").toInt();
+        uint32_t duration = parsed > 0 ? static_cast<uint32_t>(parsed) : 0;
+        settings_set_relay_pulse_ms(duration);
       }
       if (server.hasArg("auth_enabled")) {
         auto current_auth = settings_get();
@@ -1070,11 +1108,12 @@ void web_task(void* param) {
       req.payload.trigger_relay.relay_id = relay_id;
       uint32_t duration = 0;
       if (server.hasArg("duration_ms")) {
-        duration = static_cast<uint32_t>(server.arg("duration_ms").toInt());
-        if (duration < 50) {
-          duration = 50;
-        } else if (duration > 10000) {
-          duration = 10000;
+        long parsed = server.arg("duration_ms").toInt();
+        duration = parsed > 0 ? static_cast<uint32_t>(parsed) : 0;
+        if (duration < kMinRelayPulseMs) {
+          duration = kMinRelayPulseMs;
+        } else if (duration > kMaxRelayPulseMs) {
+          duration = kMaxRelayPulseMs;
         }
       }
       req.payload.trigger_relay.duration_ms = duration;
@@ -1085,6 +1124,47 @@ void web_task(void* param) {
       server.send(500, "application/json", "{\"ok\":false}");
     }
   });
+
+  server.on("/firmware", HTTP_POST,
+    [&]() {
+      if (!check_auth(server)) {
+        send_unauthorized(server, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
+        return;
+      }
+      bool ok = !Update.hasError();
+      server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+      if (ok) {
+        delay(200);
+        ESP.restart();
+      }
+    },
+    [&]() {
+      if (!check_auth(server)) {
+        return;
+      }
+      HTTPUpload& upload = server.upload();
+      if (upload.status == UPLOAD_FILE_START) {
+        Serial.printf("OTA start: %s\n", upload.filename.c_str());
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+          Serial.println("OTA begin failed");
+        }
+      } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (Update.isRunning()) {
+          if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+            Serial.println("OTA write error");
+          }
+        }
+      } else if (upload.status == UPLOAD_FILE_END) {
+        if (Update.isRunning()) {
+          if (Update.end(true)) {
+            Serial.printf("OTA done: %u bytes\n", upload.totalSize);
+          } else {
+            Serial.println("OTA end failed");
+          }
+        }
+      }
+    }
+  );
 
   server.onNotFound([&]() {
     Serial.printf("HTTP 404 %s\n", server.uri().c_str());

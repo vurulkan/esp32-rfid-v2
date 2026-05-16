@@ -4,6 +4,10 @@
 
 namespace app {
 
+constexpr uint32_t kDefaultRelayPulseMs = 600;
+constexpr uint32_t kMinRelayPulseMs = 50;
+constexpr uint32_t kMaxRelayPulseMs = 10000;
+
 struct Settings {
   bool rtc_enabled;
   bool rtc_time_valid;
@@ -18,6 +22,7 @@ struct Settings {
   char relay2_name[24];
   bool relay1_state;
   bool relay2_state;
+  uint32_t relay_pulse_ms;
   bool auth_enabled;
   char auth_user[24];
   char auth_pass[40];
@@ -34,6 +39,7 @@ bool settings_set_wifi(bool client_mode, const char* ssid, const char* pass);
 bool settings_set_wifi_static(bool enabled, const char* ip, const char* gateway, const char* mask);
 bool settings_set_relay_names(const char* relay1, const char* relay2);
 bool settings_set_relay_state(uint8_t relay_id, bool enabled);
+bool settings_set_relay_pulse_ms(uint32_t duration_ms);
 bool settings_set_auth(bool enabled, const char* user, const char* pass, const char* api_key);
 
 } // namespace app

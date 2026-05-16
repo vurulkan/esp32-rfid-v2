@@ -282,6 +282,54 @@ bool UsersDb::get_user(const char* uid, UserRecord* out) const {
   return false;
 }
 
+String UsersDb::to_json_page(size_t offset, size_t limit, size_t& out_total) const {
+  out_total = 0;
+  if (!users_ || capacity_ == 0) {
+    return "{\"users\":[],\"total\":0,\"offset\":0,\"limit\":0}";
+  }
+  for (size_t i = 0; i < capacity_; ++i) {
+    if (users_[i].in_use) {
+      ++out_total;
+    }
+  }
+  String json = "{\"users\":[";
+  bool first = true;
+  size_t skipped = 0;
+  size_t emitted = 0;
+  for (size_t i = 0; i < capacity_ && emitted < limit; ++i) {
+    const auto& user = users_[i];
+    if (!user.in_use) {
+      continue;
+    }
+    if (skipped < offset) {
+      ++skipped;
+      continue;
+    }
+    if (!first) {
+      json += ',';
+    }
+    first = false;
+    json += "{\"uid\":\"";
+    json += user.uid;
+    json += "\",\"name\":\"";
+    json += user.name;
+    json += "\",\"relay1\":";
+    json += (user.relay1 ? "true" : "false");
+    json += ",\"relay2\":";
+    json += (user.relay2 ? "true" : "false");
+    json += '}';
+    ++emitted;
+  }
+  json += "],\"total\":";
+  json += out_total;
+  json += ",\"offset\":";
+  json += offset;
+  json += ",\"limit\":";
+  json += limit;
+  json += '}';
+  return json;
+}
+
 String UsersDb::to_json() const {
   String json = "{\"users\":[";
   bool first = true;

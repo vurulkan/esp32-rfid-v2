@@ -22,7 +22,7 @@
         <button class="menu-item" data-target="maintenance">Maintenance</button>
       </nav>
       <div class="sidebar-footer">
-        <a class="menu-link" href="https://github.com/vurulkan/esp32-rfid" target="_blank" rel="noopener">View on GitHub</a>
+        <a class="menu-link" href="https://github.com/vurulkan/esp32-rfid-v2" target="_blank" rel="noopener">View on GitHub</a>
         <button class="menu-link is-hidden" id="logout" type="button">Logout</button>
       </div>
     </aside>
@@ -168,6 +168,11 @@
         <button id="save-relay-names">Save Relay Names</button>
       </div>
       <div class="card">
+        <div class="card-title">RELAY PULSE</div>
+        <label class="field">Card Read Pulse Duration (ms) <input class="text-input" type="number" id="card-relay-pulse-ms" value="600" min="50" max="10000"></label>
+        <button id="save-relay-pulse">Save Relay Pulse</button>
+      </div>
+      <div class="card">
         <div class="card-title">RTC</div>
         <label class="check">
           <input type="checkbox" id="rtc-enabled">
@@ -241,6 +246,20 @@
           <button id="reader1-test-deny">Reader 1 Deny</button>
           <button id="reader2-test-allow">Reader 2 Allow</button>
           <button id="reader2-test-deny">Reader 2 Deny</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">FIRMWARE UPDATE (OTA)</div>
+        <label>Firmware binary (.bin)
+          <input type="file" id="firmware-file" accept=".bin">
+        </label>
+        <button id="firmware-upload">Upload Firmware</button>
+        <div id="firmware-status" class="hint"></div>
+        <div id="firmware-progress" class="is-hidden" style="margin-top:10px">
+          <div class="bar">
+            <div class="bar-fill" id="firmware-bar" style="transition:width 0.3s ease"></div>
+          </div>
+          <div class="metric-value" id="firmware-pct" style="margin-top:4px">0%</div>
         </div>
       </div>
       <div class="card">
