@@ -1,0 +1,42 @@
+{
+  "firmware_version": "2.0.1",
+  "generated_at_utc": "2026-11-20T15:40:24.798411+00:00",
+  "source_head": "afded6832854d6eb6c6f87f8edde3f387f042e06",
+  "source_state": "uncommitted working tree including prior session changes",
+  "change": "Restore reader-owned single card-read beep on successful access. Do not automatically send A feedback; keep D feedback on denied or failed access and keep manual reader tests.",
+  "source_manifest_sha256": "e16c2fc3ff7763e164d6a4b2a5a5f225c515047accfb921a271d54be365087f3",
+  "esp32": {
+    "board": "esp32dev / ESP32-WROOM-32E 4 MB",
+    "platform": "espressif32@6.12.0",
+    "arduino_core": "2.0.17",
+    "partition_table": "default.csv",
+    "ota_app_slot_bytes": 1310720,
+    "filesystem_bytes": 1441792,
+    "flash_program_bytes": 958013,
+    "static_ram_bytes": 85196,
+    "image_checksum": "valid",
+    "image_validation_hash": "valid",
+    "upload_target": "web /firmware application only; preserves filesystem and partition table"
+  },
+  "validation": {
+    "python_tests_passed": 42,
+    "node_tests_passed": 3,
+    "esp32_build": "passed",
+    "git_diff_check": "passed",
+    "regression_reproduced_before_fix": true,
+    "regression_tests": [
+      "test_decision_relay_precedes_rtc_without_extra_beep",
+      "test_decision_denied_card_keeps_warning_feedback"
+    ],
+    "hardware_tested": false,
+    "device_uploaded": false
+  },
+  "nano_update_required": false,
+  "artifacts": [
+    {
+      "file": "esp32-rfid-v2-2.0.1-ota.bin",
+      "bytes": 964592,
+      "sha256": "4a89430284d962fec8a6dfe157a5e951a14591bf20969a785c897ffb971882a0"
+    }
+  ]
+}

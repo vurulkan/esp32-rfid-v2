@@ -35,7 +35,7 @@
 
 ## Overview
 - Target: ESP32_Relay X2 Board with ESP32-WROOM-32E (N4)
-- Framework: Arduino ESP32 core (2.0.17 tested, 3.3.x compatible)
+- Framework: Arduino ESP32 core 2.0.17 (tested); core 3.x is not validated
 - Architecture: FreeRTOS tasks + queues, modular components
 - Web UI: Embedded gzip assets served via `WebServer`
 
@@ -82,7 +82,7 @@ LED/BEEP lines are active-low (pull to GND to trigger).
 
 ### ESP32 <-> Nano UART
 - ESP32 RX: GPIO33
-- ESP32 TX: GPIO32 (optional, for future control)
+- ESP32 TX: GPIO32 (feedback and PING/PONG)
 - Nano TX (D1) -> ESP32 RX (GPIO33)
 - Nano RX (D0) -> ESP32 TX (GPIO32)
 - Common GND is required
@@ -102,31 +102,34 @@ LED/BEEP lines are active-low (pull to GND to trigger).
 - Hold IO0 for 10+ seconds to format LittleFS and reboot
 
 ## Tasks
-- `wifi_task`: starts AP, updates state flag only in WiFi event callback
-- `web_task`: REST API + UI
-- `reader_uart_task`: receives Wiegand events from Nano over UART
-- `logic_task`: users, logs, relay decisions
+- `wifi_task`: starts AP/STA, reconnects and opens a recovery AP after 30 seconds without STA.
+- `web_task`: REST API + UI.
+- `reader_uart_task`: bounded UART reception, framing, feedback and periodic PING.
+- `logic_task`: card authorization, relay decisions and the RAM log.
+- `users_task`: serialized user persistence and transactional restores.
+- `log_writer`: bounded FIFO flash persistence.
+- `relay_tick`: priority 4 task, checks pulse deadlines every 5 ms under the relay mutex.
+- `maint_task`: physical IO0 recovery actions.
 
 ## User Management
-- Stored in LittleFS (`/users.txt`)
-- Survives reboot/power loss
-- Max users: 1000
+- Stored in LittleFS (`/users.txt`), maximum 1000 users.
+- Add/delete saves a synchronized temporary file and renames it before publishing the RAM change. A failed save leaves existing permissions intact.
+- Restore validates the entire replacement database, including duplicates, capacity, UID, names and permission values, before commit. Restoring fewer users removes the omitted users.
+- UID is uppercase hexadecimal, up to 19 characters in storage. The Nano wire protocol accepts exactly 6 or 8 hex characters (26/34-bit Wiegand).
+- Names use up to 31 UTF-8 bytes; record delimiters and control characters are rejected rather than truncated.
 
 ## Log System
-- RAM keeps last 50 entries (ring buffer)
-- LittleFS keeps up to 10,000 entries (overwrites oldest)
-- Persisted to LittleFS (`/logs.txt`)
-- Only `granted` and `denied` entries are stored
-- When RTC is enabled and set, logs include `DD/MM/YYYY,HH:MM:SS` (as extra columns)
-- `logs.txt` uses comma-separated columns:
-  - Without RTC: `<ts_ms>,<relay>,<status>,<uid>,<name>`
-  - With RTC: `<ts_ms>,<DD/MM/YYYY>,<HH:MM:SS>,<relay>,<status>,<uid>,<name>`
-- Clearable via API
+- RAM retains the last 50 entries. JSON replies fit a byte budget, so long entries can reduce the number returned.
+- A separate low-priority task persists records through a 32-entry FIFO. Pending records can be lost on sudden power failure. Controlled OTA/reboot/format drains the queue first.
+- Recent logs rotate in approximately 16 KiB segments. Retention is limited by 512 KiB, 10,000 recent entries, and a 128 KiB free-space reserve for user/settings transactions. Oldest segments are removed as needed; there is no full-log compaction copy.
+- Existing `/logs.txt` becomes `/logs-legacy.txt` on the first upgrade boot. This archive is included in downloads and never automatically pruned. If old history leaves too little space, persistent log errors increase while card authorization continues. Download the history, then explicitly clear all logs if you want to reclaim it.
+- Clear-all is queued behind prior writes; success means accepted. `/status` exposes pending writes, errors and drops. Export flushes pending work before streaming.
+- CSV columns remain compatible: `<ts_ms>,<relay>,<status>,<uid>,<name>`; a valid RTC adds `<DD/MM/YYYY>,<HH:MM:SS>` after the timestamp.
 
 ## Settings (LittleFS)
-- Stored in `/settings.txt`
+- Stored in `/settings.txt`; settings snapshots are synchronized and changes are published only after a successful atomic file replacement.
 - RTC default is disabled after format or clean install
-- RTC set state is persisted (no need to re-set after reboot)
+- RTC validity is checked directly from DS3231 registers on boot and on each read; the legacy `rtc_valid` settings field is retained for backup compatibility and does not override hardware validity.
 - WiFi mode and credentials are persisted until format
 - Optional static IP for client mode is persisted
 - Relay names are persisted (defaults: `Relay 1`, `Relay 2`)
@@ -136,35 +139,20 @@ LED/BEEP lines are active-low (pull to GND to trigger).
 
 ## Backup & Restore
 - `GET /backup?type=users|settings|full` returns plain text
-- `POST /restore` with plain text body (auto-detects settings/users sections)
+- `POST /restore` accepts multipart backups up to 96,000 bytes (recommended for users/full backups); sectioned plain text up to 65,536 bytes remains supported.
+- Full restores journal the users/settings pair together; an interrupted commit rolls both files back on next startup. No partial replacement is published in RAM.
 - Logs can be downloaded via `/logs/export`
 
-## Configurable Constants
+## Build with PlatformIO
 
-Most device behavior is configured from the web UI or REST API. These values are compile-time defaults or limits:
-
-| Constant | File | Default | Description |
-| --- | --- | --- | --- |
-| `kDefaultRelayPulseMs` | `src/esp32-rfid/settings.h` | `600` | Default relay activation duration on card read (ms) |
-| `kMinRelayPulseMs` | `src/esp32-rfid/settings.h` | `50` | Minimum allowed relay pulse duration (ms) |
-| `kMaxRelayPulseMs` | `src/esp32-rfid/settings.h` | `10000` | Maximum allowed relay pulse duration (ms) |
-| `kMaxFileLogs` | `src/esp32-rfid/log.cpp` | `10000` | Maximum log entries stored in LittleFS |
-
-Relay pulse duration can be changed without recompiling from Settings -> Relay Pulse, or with the REST API:
-```bash
-curl -X POST "http://192.168.4.1/settings" \
-  -d "relay_pulse_ms=1000"
+```sh
+pio run -e esp32dev
+pio run -d nano
 ```
 
-**Example - increase log limit to 50,000:**
-```cpp
-// log.cpp
-constexpr size_t kMaxFileLogs = 50000;
-```
+ESP32 uses pinned `espressif32@6.12.0` / Arduino 2.0.17 and the default 4 MB OTA partition table. Web gzip headers are generated automatically and deterministically before compilation. Output: `.pio/build/esp32dev/firmware.bin`.
 
-> **Note on `kMaxFileLogs`:** The default 4MB partition gives LittleFS approximately 1.5 MB. At ~70 bytes per log entry (with RTC), the physical ceiling is around 21,000 entries. Trim requires free space to write a temporary file, so if LittleFS fills up the trim cannot run and new entries will silently stop being written. Keep `kMaxFileLogs` at or below **~15,000** to stay safely within the filesystem capacity.
-
-Recompile and upload after changing compile-time constants.
+Relay pulse duration is configurable from Settings or `POST /settings` (`relay_pulse_ms=1000`). Supported range is 50 through 10,000 ms; the API rejects out-of-range values.
 
 ## Build & Upload (Arduino IDE)
 1. Install ESP32 core (2.0.17 recommended).
@@ -193,7 +181,8 @@ src/esp32-rfid/
 Only `esp32-rfid.ino.bin` is needed for OTA. The bootloader and partition files are not required.
 
 ## Nano Firmware
-- Wiegand bridge firmware is in `nano/wiegand_nano/wiegand_nano.ino`.
+- Wiegand bridge firmware is in `nano/wiegand_nano/wiegand_nano.ino`. The updated source adds atomic frame handoff, standard 26/34-bit parity validation and overflow recovery.
+- The ESP32 update also works with the previous Nano protocol. Flashing the Nano is optional and requires its USB/serial connection; an ESP32 OTA does not update the Nano.
 - UART: 115200 baud, output format `1,UID` or `2,UID` per line.
 - Feedback commands from ESP32: `A,<reader>` (allow) or `D,<reader>` (deny).
 
@@ -212,7 +201,7 @@ When authentication is enabled, add `-H "X-API-Key: YOUR_KEY"` to every request,
 ### Users
 
 #### List users
-Paginated - 50 users per page by default.
+Paginated - 50 users per page by default. Pages can be shorter to fit the response byte budget; increment offset by the number of returned users until total is reached.
 
 | Parameter | Default | Description |
 | --- | --- | --- |
@@ -324,7 +313,7 @@ curl -X POST "http://192.168.4.1/settings" \
 ```
 
 #### Set card-read relay pulse duration
-Relay pulse duration is used when an authorized card is read. Values outside `50-10000` ms are clamped.
+Relay pulse duration is used when an authorized card is read. Values outside `50-10000` ms are rejected.
 ```bash
 curl -X POST "http://192.168.4.1/settings" \
   -d "relay_pulse_ms=1000"
@@ -383,8 +372,7 @@ curl "http://192.168.4.1/backup?type=full" -o backup-full.txt
 #### Restore from backup file
 ```bash
 curl -X POST "http://192.168.4.1/restore" \
-  -H "Content-Type: text/plain" \
-  --data-binary @backup-full.txt
+  -F "file=@backup-full.txt"
 ```
 
 ---
@@ -497,6 +485,40 @@ python pack_web.py
 - `UID` should be uppercase hex without spaces (e.g., `D7EE4C06`)
 
 ## UART Protocol (ESP32 -> Nano)
+- Automatic card handling sends no additional success beep: readers keep their own card-read sound. Denied access still sends `D,<reader>`. The manual reader test can explicitly send `A,<reader>`.
 - `A,1` or `A,2` -> access granted (LED + beep)
 - `D,1` or `D,2` -> access denied (double beep)
 - `PING` -> Nano replies with `PONG`
+
+## Reliability diagnostics and data-preserving updates
+
+- `/status` and the UI diagnostics show UART reception/errors/invalid frames, queue drops, feedback drops, periodic PONG time, log errors/drops/pending writes, logic heartbeat, maximum queue delay, expired cards, startup readiness, relay GPIO state, reset reason and minimum/largest heap. Counters reset on reboot. GPIO state is the ESP32 output level, not physical confirmation that the lock opened.
+- Queue-set membership is configured while queues are empty, before any producers start. Readers/web wait for application initialization. Initialization failures are reported instead of silently reducing user capacity.
+- Card authorization drives the relay before RTC reads and log preparation. User saves and flash logs run in separate tasks. Card events aged 2 seconds or more and expired relay requests are discarded.
+- HTTP request IDs and separate persistent reply queues reject stale/cross-worker replies. The UI checks HTTP/application failures, bounds fetch time, and prevents overlapping polls or polling during uploads.
+- OTA accepts exactly one firmware file. It finalizes only after the full HTTP request is accepted and maintenance preparation succeeds. Failed/aborted requests do not trigger reboot or release someone else's maintenance state.
+- Upload only the application `.bin` through the existing Firmware Update page. The update preserves the existing filesystem and partition table. Keep a users/settings backup; do not select format, erase flash, upload filesystem, or upload bootloader/partition binaries for this update.
+- The build default describes this binary's supported board/layout; it does not inspect a deployed board. This binary fits the default 1,310,720-byte app slot. Other deployed layouts need their own capacity check.
+- Authentication requires complete valid credentials. Password/configuration changes invalidate old sessions. Sessions expire after 5 minutes of inactivity using a 64-bit clock; the API key remains an independent credential.
+- Partial settings updates preserve omitted fields. `wifi_pass_clear=1` explicitly clears a saved WiFi password; all persisted network changes report the need to reboot.
+- See [the completed repair report](docs/duzeltmeler-2026-11-20.md) for the finding-by-finding changes, exact test evidence and hardware limits.
+
+## DS3231 RTC reliability
+
+- Startup/toggling never sets a default date or overwrites the battery-backed time. The legacy `rtc_valid` flash value cannot override the live hardware checks.
+- Reads validate OSF, EOSC, BCD, calendar ranges and 12/24-hour registers. Supported dates are 2000 through 2099. Startup enables battery-backed oscillation while preserving the time and oscillator-loss evidence.
+- Explicit adjustment clears OSF only after writing the requested time. Readback must match within one second. A persistent adjustment marker makes an interrupted write visible after reboot until the time is set successfully again.
+- RTC access shares a mutex with a 50 ms lock wait and 50 ms I2C timeout. Temporary bus failures are retried on future reads. Relay activation precedes RTC access.
+- States: `disabled`, `unavailable`, `busy`, `lost_power`, `invalid_datetime`, `oscillator_disabled`, `adjustment_pending`, `ready`. `lost_power` describes the oscillator-stop flag, not a measured battery voltage.
+- An old uncleared OSF may require setting the date/time once after upgrade. Firmware cannot restore a failed battery or repair wiring/noise.
+
+## Validation
+
+Host tests use production C++ services/callbacks with simulated RTOS/GPIO/I2C/HTTP, POSIX temporary files and address/undefined-behavior sanitizers. Requirements: Linux/WSL, g++, Python 3; Node.js for UI tests.
+
+```sh
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+node --test tests/web.test.cjs
+```
+
+After OTA on the actual installation, verify users/settings, both readers under web/log activity, relay pulse duration, and RTC time retention across a main-power interruption. The host tests and successful builds do not establish the physical cause of the intermittent fault, battery health, real flash power-loss behavior or FreeRTOS latency under electrical interference.

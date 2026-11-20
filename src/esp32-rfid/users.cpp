@@ -1,363 +1,346 @@
 #include "users.h"
-
-#include <cstring>
-#include <cstdlib>
+#include "storage.h"
+#include "validation.h"
+#include "messages.h"
+#include "app_context.h"
+#include "rtc.h"
+#include "relay.h"
 #include <LittleFS.h>
-
-namespace {
-constexpr const char* kUsersPath = "/users.txt";
-
-bool parse_bool(const char* token) {
-  if (!token) {
-    return false;
-  }
-  return token[0] == '1' || token[0] == 't' || token[0] == 'T' || token[0] == 'y' || token[0] == 'Y';
-}
-} // namespace
-
+#include <cstdlib>
 namespace app {
-
+namespace {
+struct Lock {
+  SemaphoreHandle_t m;
+  explicit Lock(SemaphoreHandle_t x) : m(x) {
+    if (m) xSemaphoreTake(m, portMAX_DELAY);
+  }
+  ~Lock() {
+    if (m) xSemaphoreGive(m);
+  }
+};
+bool read_records(FILE* f, UserRecord* records, size_t capacity, Settings* config,
+                  bool* has_config) {
+  char line[96];
+  size_t count = 0;
+  bool wrapped = false, seen_users = false, seen_settings = false;
+  enum Section { None, Users, SettingsSection };
+  Section section = None;
+  String settings_text;
+  *has_config = false;
+  while (true) {
+    long before = ftell(f);
+    if (!fgets(line, sizeof(line), f)) break;
+    if (ftell(f) - before != long(strlen(line))) return false;
+    size_t n = strlen(line);
+    if (n == sizeof(line) - 1 && line[n - 1] != '\n') return false;
+    while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+    if (!n) continue;
+    if (!wrapped && !count && strcmp(line, "#RFID_BACKUP") == 0) {
+      wrapped = true;
+      continue;
+    }
+    if (wrapped) {
+      if (section == None) {
+        if (strcmp(line, "[users]") == 0 && !seen_users) {
+          section = Users;
+          seen_users = true;
+          continue;
+        }
+        if (strcmp(line, "[settings]") == 0 && !seen_settings) {
+          section = SettingsSection;
+          seen_settings = true;
+          continue;
+        }
+        return false;
+      }
+      if (section == Users && strcmp(line, "[/users]") == 0) {
+        section = None;
+        continue;
+      }
+      if (section == SettingsSection) {
+        if (strcmp(line, "[/settings]") == 0) {
+          section = None;
+          continue;
+        }
+        if (settings_text.length() + n + 1 > 4096 || !settings_text.concat(line, n) ||
+            !settings_text.concat("\n", 1))
+          return false;
+        continue;
+      }
+    }
+    if (count >= capacity) return false;
+    char* a = strchr(line, '|');
+    if (!a) return false;
+    *a++ = 0;
+    char* b = strchr(a, '|');
+    if (!b) return false;
+    *b++ = 0;
+    char* c = strchr(b, '|');
+    if (!c) return false;
+    *c++ = 0;
+    if ((strcmp(b, "0") && strcmp(b, "1")) || (strcmp(c, "0") && strcmp(c, "1"))) return false;
+    UserRecord r{};
+    if (!normalize_uid(line, r.uid, sizeof(r.uid)) || !valid_field(a, sizeof(r.name))) return false;
+    for (size_t i = 0; i < count; ++i)
+      if (strcmp(records[i].uid, r.uid) == 0) return false;
+    strcpy(r.name, a);
+    r.in_use = true;
+    r.relay1 = *b == '1';
+    r.relay2 = *c == '1';
+    records[count++] = r;
+  }
+  if (ferror(f) || (wrapped && (!seen_users || section != None))) return false;
+  if (seen_settings) {
+    if (!settings_parse_text(settings_text, config)) return false;
+    *has_config = true;
+  }
+  return true;
+}
+bool write_record(FILE* f, const UserRecord& r) {
+  return !r.in_use || fprintf(f, "%s|%s|%d|%d\n", r.uid, r.name, r.relay1, r.relay2) > 0;
+}
+}  // namespace
+UsersDb& users_database() {
+  static UsersDb db;
+  return db;
+}
+UsersDb::~UsersDb() {
+  free(users_);
+  if (mutex_) vSemaphoreDelete(mutex_);
+}
 void UsersDb::init() {
-  if (users_ == nullptr) {
-    users_ = static_cast<UserRecord*>(malloc(sizeof(UserRecord) * kMaxUsers));
-    capacity_ = users_ ? kMaxUsers : 0;
-    if (!users_) {
-      users_ = static_cast<UserRecord*>(malloc(sizeof(UserRecord) * 500));
-      capacity_ = users_ ? 500 : 0;
+  if (!mutex_) mutex_ = xSemaphoreCreateMutex();
+  if (mutex_) capacity_ = kMaxUsers;
+}
+bool UsersDb::replace_file(const char* path, bool persist, const Settings* config) {
+  StorageLock fs;
+  if (!fs || !storage_ready() || !mutex_) return false;
+  auto* replacement = static_cast<UserRecord*>(calloc(capacity_, sizeof(UserRecord)));
+  if (!replacement) return false;
+  String full = RFID_FS_ROOT;
+  full += path;
+  FILE* f = fopen(full.c_str(), "rb");
+  Settings parsed_settings = settings_get();
+  bool has_parsed_settings = false;
+  bool ok = f && read_records(f, replacement, capacity_, &parsed_settings, &has_parsed_settings);
+  if (has_parsed_settings) {
+    if (config || !persist)
+      ok = false;
+    else
+      config = &parsed_settings;
+  }
+  if (f) fclose(f);
+  if (ok && config && !settings_validate(*config)) ok = false;
+  if (ok && persist) {
+    auto write = [&](FILE* out) {
+      for (size_t i = 0; i < capacity_; ++i)
+        if (!write_record(out, replacement[i])) return false;
+      return true;
+    };
+    ok = config ? storage_replace_access_state(write, settings_encode(*config))
+                : storage_atomic_write("/users.txt", write);
+  }
+  if (ok) {
+    UserRecord* old;
+    {
+      Lock lock(mutex_);
+      old = users_;
+      users_ = replacement;
+      ready_ = true;
+      if (config) settings_publish_committed(*config);
     }
-  }
-  if (!users_ || capacity_ == 0) {
-    return;
-  }
-  for (size_t i = 0; i < capacity_; ++i) {
-    users_[i].in_use = false;
-    users_[i].uid[0] = '\0';
-    users_[i].name[0] = '\0';
-    users_[i].relay1 = false;
-    users_[i].relay2 = false;
-  }
+    free(old);
+  } else
+    free(replacement);
+  return ok;
 }
-
-void UsersDb::clear() {
-  if (!users_ || capacity_ == 0) {
-    return;
-  }
-  for (size_t i = 0; i < capacity_; ++i) {
-    users_[i].in_use = false;
-    users_[i].uid[0] = '\0';
-    users_[i].name[0] = '\0';
-    users_[i].relay1 = false;
-    users_[i].relay2 = false;
-  }
-}
-
 bool UsersDb::load() {
-  if (!LittleFS.begin()) {
-    return false;
+  StorageLock fs;
+  if (!fs || !storage_ready() || !mutex_) return false;
+  if (!LittleFS.exists("/users.txt")) {
+    Lock lock(mutex_);
+    if (!users_) users_ = static_cast<UserRecord*>(calloc(capacity_, sizeof(UserRecord)));
+    ready_ = users_ != nullptr;
+    return ready_;
   }
-  if (!LittleFS.exists(kUsersPath)) {
-    return true;
-  }
-  File file = LittleFS.open(kUsersPath, FILE_READ);
-  if (!file) {
-    return false;
-  }
-  suppress_save_ = true;
-  while (file.available()) {
-    String line = file.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0) {
-      continue;
-    }
-    int p1 = line.indexOf('|');
-    int p2 = line.indexOf('|', p1 + 1);
-    int p3 = line.indexOf('|', p2 + 1);
-    if (p1 < 0 || p2 < 0 || p3 < 0) {
-      continue;
-    }
-    String uid = line.substring(0, p1);
-    String name = line.substring(p1 + 1, p2);
-    String d1 = line.substring(p2 + 1, p3);
-    String d2 = line.substring(p3 + 1);
-    add_user(uid.c_str(), name.c_str(), parse_bool(d1.c_str()), parse_bool(d2.c_str()));
-  }
-  suppress_save_ = false;
-  file.close();
-  return true;
+  return replace_file("/users.txt", false);
 }
-
-bool UsersDb::save() const {
-  if (!LittleFS.begin()) {
-    return false;
-  }
-  File file = LittleFS.open(kUsersPath, FILE_WRITE);
-  if (!file) {
-    return false;
-  }
-  if (!users_ || capacity_ == 0) {
-    file.close();
-    return true;
-  }
-  for (size_t i = 0; i < capacity_; ++i) {
-    const auto & user = users_[i];
-    if (!user.in_use) {
-      continue;
-    }
-    file.print(user.uid);
-    file.print('|');
-    file.print(user.name);
-    file.print('|');
-    file.print(user.relay1 ? '1' : '0');
-    file.print('|');
-    file.print(user.relay2 ? '1' : '0');
-    file.print('\n');
-  }
-  file.close();
-  return true;
+bool UsersDb::restore_file(const char* path, const Settings* config) {
+  return replace_file(path, true, config);
 }
-
-static void copy_field(char* dest, size_t dest_len, const char* src) {
-  if (!dest || dest_len == 0) {
-    return;
-  }
-  if (!src) {
-    dest[0] = '\0';
-    return;
-  }
-  strncpy(dest, src, dest_len - 1);
-  dest[dest_len - 1] = '\0';
-}
-
-bool UsersDb::add_user(const char* uid, const char* name, bool relay1, bool relay2) {
-  if (!uid || uid[0] == '\0') {
-    return false;
-  }
-
-  if (!users_ || capacity_ == 0) {
-    return false;
-  }
-
-  for (size_t i = 0; i < capacity_; ++i) {
-    auto & user = users_[i];
-    if (user.in_use && strcmp(user.uid, uid) == 0) {
-      return false;
-    }
-  }
-
-  for (size_t i = 0; i < capacity_; ++i) {
-    auto & user = users_[i];
-    if (!user.in_use) {
-      user.in_use = true;
-      copy_field(user.uid, sizeof(user.uid), uid);
-      copy_field(user.name, sizeof(user.name), name);
-      user.relay1 = relay1;
-      user.relay2 = relay2;
-      if (!suppress_save_) {
-        save();
+bool UsersDb::save_overlay(size_t index, const UserRecord& candidate) const {
+  return storage_atomic_write("/users.txt", [&](FILE* f) {
+    for (size_t i = 0; i < capacity_; ++i) {
+      UserRecord r;
+      {
+        Lock lock(mutex_);
+        r = i == index ? candidate : users_[i];
       }
-      return true;
+      if (!write_record(f, r)) return false;
     }
-  }
-
-  return false;
+    return true;
+  });
 }
-
-String UsersDb::to_text() const {
-  String out;
-  if (!users_ || capacity_ == 0) {
-    return out;
-  }
-  for (size_t i = 0; i < capacity_; ++i) {
-    const auto & user = users_[i];
-    if (!user.in_use) {
-      continue;
+bool UsersDb::add_user(const char* uid, const char* name, bool a, bool b) {
+  if (!ready_) return false;
+  UserRecord r{};
+  if (!normalize_uid(uid, r.uid, sizeof(r.uid)) || !valid_field(name, sizeof(r.name))) return false;
+  strcpy(r.name, name);
+  r.in_use = true;
+  r.relay1 = a;
+  r.relay2 = b;
+  StorageLock fs;
+  if (!fs) return false;
+  size_t slot = capacity_;
+  {
+    Lock lock(mutex_);
+    for (size_t i = 0; i < capacity_; ++i) {
+      if (users_[i].in_use && strcmp(users_[i].uid, r.uid) == 0) return false;
+      if (!users_[i].in_use && slot == capacity_) slot = i;
     }
-    out += user.uid;
-    out += '|';
-    out += user.name;
-    out += '|';
-    out += (user.relay1 ? '1' : '0');
-    out += '|';
-    out += (user.relay2 ? '1' : '0');
-    out += '\n';
   }
-  return out;
+  if (slot == capacity_ || !save_overlay(slot, r)) return false;
+  {
+    Lock lock(mutex_);
+    users_[slot] = r;
+  }
+  return true;
 }
-
-bool UsersDb::import_text(const char* text) {
-  if (!text) {
-    return false;
-  }
-  suppress_save_ = true;
-  clear();
-  String data(text);
-  int start = 0;
-  while (start < data.length()) {
-    int end = data.indexOf('\n', start);
-    if (end < 0) {
-      end = data.length();
-    }
-    String line = data.substring(start, end);
-    line.trim();
-    start = end + 1;
-    if (line.length() == 0) {
-      continue;
-    }
-    int p1 = line.indexOf('|');
-    int p2 = line.indexOf('|', p1 + 1);
-    int p3 = line.indexOf('|', p2 + 1);
-    if (p1 < 0 || p2 < 0 || p3 < 0) {
-      continue;
-    }
-    String uid = line.substring(0, p1);
-    String name = line.substring(p1 + 1, p2);
-    String d1 = line.substring(p2 + 1, p3);
-    String d2 = line.substring(p3 + 1);
-    add_user(uid.c_str(), name.c_str(), parse_bool(d1.c_str()), parse_bool(d2.c_str()));
-  }
-  suppress_save_ = false;
-  return save();
-}
-
 bool UsersDb::remove(const char* uid) {
-  if (!uid || uid[0] == '\0') {
-    return false;
-  }
-  if (!users_ || capacity_ == 0) {
-    return false;
-  }
-  for (size_t i = 0; i < capacity_; ++i) {
-    auto & user = users_[i];
-    if (user.in_use && strcmp(user.uid, uid) == 0) {
-      user.in_use = false;
-      user.uid[0] = '\0';
-      user.name[0] = '\0';
-      user.relay1 = false;
-      user.relay2 = false;
-      if (!suppress_save_) {
-        save();
+  if (!ready_) return false;
+  char key[20];
+  if (!normalize_uid(uid, key, sizeof(key))) return false;
+  StorageLock fs;
+  if (!fs) return false;
+  size_t slot = capacity_;
+  {
+    Lock lock(mutex_);
+    for (size_t i = 0; i < capacity_; ++i)
+      if (users_[i].in_use && strcmp(users_[i].uid, key) == 0) {
+        slot = i;
+        break;
       }
-      return true;
-    }
   }
-  return false;
+  UserRecord empty{};
+  if (slot == capacity_ || !save_overlay(slot, empty)) return false;
+  {
+    Lock lock(mutex_);
+    users_[slot] = empty;
+  }
+  return true;
 }
-
-bool UsersDb::authorized(const char* uid, uint8_t relay_id) const {
-  if (!uid || uid[0] == '\0') {
-    return false;
-  }
-  if (!users_ || capacity_ == 0) {
-    return false;
-  }
-  for (size_t i = 0; i < capacity_; ++i) {
-    const auto & user = users_[i];
-    if (user.in_use && strcmp(user.uid, uid) == 0) {
-      if (relay_id == 1) {
-        return user.relay1;
-      }
-      if (relay_id == 2) {
-        return user.relay2;
-      }
-      return false;
-    }
-  }
-  return false;
-}
-
 bool UsersDb::get_user(const char* uid, UserRecord* out) const {
-  if (!uid || uid[0] == '\0' || !out) {
-    return false;
-  }
-  if (!users_ || capacity_ == 0) {
-    return false;
-  }
-  for (size_t i = 0; i < capacity_; ++i) {
-    const auto & user = users_[i];
-    if (user.in_use && strcmp(user.uid, uid) == 0) {
-      *out = user;
+  if (!ready_ || !out) return false;
+  char key[20];
+  if (!normalize_uid(uid, key, sizeof(key))) return false;
+  Lock lock(mutex_);
+  for (size_t i = 0; i < capacity_; ++i)
+    if (users_[i].in_use && strcmp(users_[i].uid, key) == 0) {
+      *out = users_[i];
       return true;
     }
-  }
   return false;
 }
-
-String UsersDb::to_json_page(size_t offset, size_t limit, size_t& out_total) const {
-  out_total = 0;
-  if (!users_ || capacity_ == 0) {
-    return "{\"users\":[],\"total\":0,\"offset\":0,\"limit\":0}";
-  }
-  for (size_t i = 0; i < capacity_; ++i) {
-    if (users_[i].in_use) {
-      ++out_total;
-    }
-  }
+bool UsersDb::authorized(const char* uid, uint8_t id) const {
+  UserRecord r{};
+  return get_user(uid, &r) && ((id == 1 && r.relay1) || (id == 2 && r.relay2));
+}
+String UsersDb::to_json_page(size_t offset, size_t limit, size_t& total) const {
+  total = 0;
   String json = "{\"users\":[";
-  bool first = true;
-  size_t skipped = 0;
-  size_t emitted = 0;
-  for (size_t i = 0; i < capacity_ && emitted < limit; ++i) {
-    const auto& user = users_[i];
-    if (!user.in_use) {
-      continue;
-    }
-    if (skipped < offset) {
-      ++skipped;
-      continue;
-    }
-    if (!first) {
-      json += ',';
-    }
-    first = false;
-    json += "{\"uid\":\"";
-    json += user.uid;
-    json += "\",\"name\":\"";
-    json += user.name;
-    json += "\",\"relay1\":";
-    json += (user.relay1 ? "true" : "false");
-    json += ",\"relay2\":";
-    json += (user.relay2 ? "true" : "false");
-    json += '}';
+  if (!ready_) return "{\"ok\":false,\"error\":\"users_unavailable\"}";
+  Lock lock(mutex_);
+  size_t emitted = 0, position = 0;
+  for (size_t i = 0; i < capacity_; ++i)
+    if (users_[i].in_use) ++total;
+  for (size_t i = 0; i < capacity_; ++i) {
+    const auto& r = users_[i];
+    if (!r.in_use) continue;
+    size_t pos = position++;
+    if (pos < offset || emitted >= limit) continue;
+    String item = "{\"uid\":";
+    item += json_quote(r.uid);
+    item += ",\"name\":";
+    item += json_quote(r.name);
+    item += ",\"relay1\":";
+    item += r.relay1 ? "true" : "false";
+    item += ",\"relay2\":";
+    item += r.relay2 ? "true" : "false";
+    item += '}';
+    if (json.length() + item.length() + 100 > kLogicResponseMax) break;
+    if (emitted) json += ',';
+    json += item;
     ++emitted;
   }
   json += "],\"total\":";
-  json += out_total;
+  json += total;
   json += ",\"offset\":";
   json += offset;
   json += ",\"limit\":";
   json += limit;
-  json += '}';
+  json += "}";
   return json;
 }
-
-String UsersDb::to_json() const {
-  String json = "{\"users\":[";
-  bool first = true;
-  if (!users_ || capacity_ == 0) {
-    json += "]}";
-    return json;
-  }
-  for (size_t i = 0; i < capacity_; ++i) {
-    const auto & user = users_[i];
-    if (!user.in_use) {
-      continue;
+void users_task(void* param) {
+  auto* queues = static_cast<AppQueues*>(param);
+  xEventGroupWaitBits(queues->events, kAppReady, pdFALSE, pdTRUE, portMAX_DELAY);
+  static LogicResponse resp;
+  for (;;) {
+    LogicRequest req{};
+    if (xQueueReceive(queues->user_queue, &req, portMAX_DELAY) != pdTRUE) continue;
+    bool ok = false;
+    String json;
+    if (app_maintenance() && req.type != LogicRequestType::RestoreUsers)
+      json = "{\"ok\":false,\"error\":\"maintenance\"}";
+    else
+      switch (req.type) {
+        case LogicRequestType::GetUsers: {
+          size_t total;
+          json = users_database().to_json_page(req.payload.get_users.offset,
+                                               req.payload.get_users.limit, total);
+          ok = users_database().ready();
+          break;
+        }
+        case LogicRequestType::AddUser: {
+          UserRecord old{};
+          if (users_database().get_user(req.payload.add_user.uid, &old))
+            json = "{\"ok\":false,\"error\":\"uid_exists\"}";
+          else
+            ok =
+                users_database().add_user(req.payload.add_user.uid, req.payload.add_user.name,
+                                          req.payload.add_user.relay1, req.payload.add_user.relay2);
+          break;
+        }
+        case LogicRequestType::DeleteUser:
+          ok = users_database().remove(req.payload.del_user.uid);
+          break;
+        case LogicRequestType::RestoreUsers:
+          ok = users_database().restore_file(req.payload.restore_users.path,
+                                             req.payload.restore_users.has_settings
+                                                 ? &req.payload.restore_users.settings
+                                                 : nullptr);
+          if (ok) {
+            auto s = settings_get();
+            rtc_init(s.rtc_enabled);
+            relay_set_state(1, s.relay1_state);
+            relay_set_state(2, s.relay2_state);
+          }
+          break;
+        default:
+          break;
+      }
+    if (req.type == LogicRequestType::RestoreUsers) {
+      StorageLock fs;
+      LittleFS.remove(req.payload.restore_users.path);
+      if (storage_ready()) app_set_maintenance(false);
     }
-    if (!first) {
-      json += ',';
-    }
-    first = false;
-    json += "{\"uid\":\"";
-    json += user.uid;
-    json += "\",\"name\":\"";
-    json += user.name;
-    json += "\",\"relay1\":";
-    json += (user.relay1 ? "true" : "false");
-    json += ",\"relay2\":";
-    json += (user.relay2 ? "true" : "false");
-    json += '}';
+    if (!json.length())
+      json = ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"user_operation_failed\"}";
+    memset(&resp, 0, sizeof(resp));
+    resp.request_id = req.request_id;
+    resp.ok = ok;
+    strncpy(resp.json, json.c_str(), sizeof(resp.json) - 1);
+    if (req.reply_queue) xQueueOverwrite(req.reply_queue, &resp);
   }
-  json += "]}";
-  return json;
 }
-
-} // namespace app
+}  // namespace app

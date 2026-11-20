@@ -1,33 +1,33 @@
 #pragma once
-
 #include <Arduino.h>
-
+#include <vector>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 namespace app {
-
+uint32_t log_dropped_writes();
+uint32_t log_write_errors();
+uint32_t log_pending_writes();
+bool log_flush(uint32_t timeout_ms);
+std::vector<String> log_files();
 struct LogEntry {
   uint32_t ts_ms;
   char msg[160];
 };
-
 class LogBuffer {
  public:
   void init();
   bool load();
-  bool save() const;
-  void add(const char* msg, uint32_t ts_ms);
+  bool start_writer();
+  void add(const char*, uint32_t);
   String to_json() const;
-  String to_text() const;
-  bool import_text(const char* text);
   void clear_ram();
-  void clear_all();
+  bool clear_all();
 
  private:
-  void add_internal(const char* msg, uint32_t ts_ms, bool persist);
-  static constexpr size_t kMaxLogs = 50;
-  LogEntry entries_[kMaxLogs];
-  size_t head_ = 0;
-  size_t count_ = 0;
-  size_t file_count_ = 0;
+  static void writer_task(void*);
+  void add_ram(const char*, uint32_t);
+  QueueHandle_t write_queue_ = nullptr;
+  LogEntry entries_[50];
+  size_t head_ = 0, count_ = 0;
 };
-
-} // namespace app
+}  // namespace app

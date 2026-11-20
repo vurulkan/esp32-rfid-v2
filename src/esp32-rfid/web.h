@@ -6,4 +6,4 @@ namespace app {
 
 void web_task(void* param);
 
-} // namespace app
+}  // namespace app

@@ -1,81 +1,72 @@
 #include "relay.h"
-
 #include <freertos/FreeRTOS.h>
-#include <freertos/timers.h>
-
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 namespace app {
-
 namespace {
-constexpr uint8_t kRelay1Pin = 16;
-constexpr uint8_t kRelay2Pin = 17;
-
-TimerHandle_t g_relay1_timer = nullptr;
-TimerHandle_t g_relay2_timer = nullptr;
-bool g_relay1_manual = false;
-bool g_relay2_manual = false;
-
-void relay_off_callback(TimerHandle_t timer) {
-  uint32_t relay_id = reinterpret_cast<uint32_t>(pvTimerGetTimerID(timer));
-  if (relay_id == 1) {
-    digitalWrite(kRelay1Pin, LOW);
-  } else if (relay_id == 2) {
-    digitalWrite(kRelay2Pin, LOW);
+constexpr uint8_t pins[] = {16, 17};
+struct State {
+  bool manual = false;
+  bool pulse = false;
+  uint32_t deadline = 0;
+};
+State state[2];
+SemaphoreHandle_t mutex = nullptr;
+bool ready = false;
+void update_outputs(uint32_t now) {
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  for (size_t i = 0; i < 2; ++i)
+    if (state[i].pulse && int32_t(now - state[i].deadline) >= 0) {
+      state[i].pulse = false;
+      digitalWrite(pins[i], state[i].manual ? HIGH : LOW);
+    }
+  xSemaphoreGive(mutex);
+}
+void tick(void*) {
+  for (;;) {
+    update_outputs(millis());
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
 
-void start_timer(TimerHandle_t timer, uint32_t duration_ms) {
-  if (timer == nullptr) {
-    return;
+}  // namespace
+bool relay_init() {
+  for (uint8_t pin : pins) {
+    digitalWrite(pin, LOW);
+    pinMode(pin, OUTPUT);
   }
-  xTimerStop(timer, 0);
-  xTimerChangePeriod(timer, pdMS_TO_TICKS(duration_ms), 0);
-  xTimerStart(timer, 0);
+  mutex = xSemaphoreCreateMutex();
+  if (!mutex) return false;
+  ready = xTaskCreatePinnedToCore(tick, "relay_tick", 2048, nullptr, 4, nullptr, 1) == pdPASS;
+  return ready;
 }
-
-} // namespace
-
-void relay_init() {
-  pinMode(kRelay1Pin, OUTPUT);
-  pinMode(kRelay2Pin, OUTPUT);
-  digitalWrite(kRelay1Pin, LOW);
-  digitalWrite(kRelay2Pin, LOW);
-
-  g_relay1_timer = xTimerCreate("relay1", pdMS_TO_TICKS(500), pdFALSE,
-                                reinterpret_cast<void*>(1), relay_off_callback);
-  g_relay2_timer = xTimerCreate("relay2", pdMS_TO_TICKS(500), pdFALSE,
-                                reinterpret_cast<void*>(2), relay_off_callback);
-}
-
-void relay_activate(uint8_t relay_id, uint32_t duration_ms) {
-  if (relay_id == 1) {
-    if (g_relay1_manual) {
-      return;
-    }
-    digitalWrite(kRelay1Pin, HIGH);
-    start_timer(g_relay1_timer, duration_ms);
-  } else if (relay_id == 2) {
-    if (g_relay2_manual) {
-      return;
-    }
-    digitalWrite(kRelay2Pin, HIGH);
-    start_timer(g_relay2_timer, duration_ms);
+bool relay_activate(uint8_t id, uint32_t duration) {
+  if (!ready || id < 1 || id > 2 || duration < 50 || duration > 10000) return false;
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  auto& s = state[id - 1];
+  if (!s.manual) {
+    s.pulse = true;
+    s.deadline = millis() + duration;
+    digitalWrite(pins[id - 1], HIGH);
   }
+  xSemaphoreGive(mutex);
+  return true;
 }
-
-void relay_set_state(uint8_t relay_id, bool enabled) {
-  if (relay_id == 1) {
-    g_relay1_manual = enabled;
-    if (enabled) {
-      xTimerStop(g_relay1_timer, 0);
-    }
-    digitalWrite(kRelay1Pin, enabled ? HIGH : LOW);
-  } else if (relay_id == 2) {
-    g_relay2_manual = enabled;
-    if (enabled) {
-      xTimerStop(g_relay2_timer, 0);
-    }
-    digitalWrite(kRelay2Pin, enabled ? HIGH : LOW);
-  }
+bool relay_set_state(uint8_t id, bool enabled) {
+  if (!ready || id < 1 || id > 2) return false;
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  state[id - 1].manual = enabled;
+  state[id - 1].pulse = false;
+  digitalWrite(pins[id - 1], enabled ? HIGH : LOW);
+  xSemaphoreGive(mutex);
+  return true;
 }
-
-} // namespace app
+bool relay_ready() { return ready; }
+bool relay_output_state(uint8_t id) {
+  if (!ready || id < 1 || id > 2) return false;
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  bool high = digitalRead(pins[id - 1]) == HIGH;
+  xSemaphoreGive(mutex);
+  return high;
+}
+}  // namespace app

@@ -2,6 +2,10 @@
 // Output format: "1,UID" or "2,UID" (one line per read)
 
 #include <Arduino.h>
+#include <util/atomic.h>
+
+void setup();
+void loop();
 
 namespace {
 constexpr uint32_t kBaud = 115200;
@@ -24,6 +28,7 @@ struct ReaderState {
   volatile uint8_t bits;
   volatile uint64_t data;
   volatile uint32_t last_us;
+  volatile bool overflow;
 };
 
 struct FeedbackState {
@@ -33,29 +38,26 @@ struct FeedbackState {
   uint32_t next_ms = 0;
 };
 
-ReaderState g_r1{0, 0, 0};
-ReaderState g_r2{0, 0, 0};
+ReaderState g_r1{0, 0, 0, false};
+ReaderState g_r2{0, 0, 0, false};
 volatile uint8_t g_last_portd = 0;
 FeedbackState g_fb1{};
 FeedbackState g_fb2{};
 
 void handle_bit(ReaderState& r, uint8_t bit) {
-  if (r.bits >= 64) {
-    r.bits = 0;
-    r.data = 0;
+  if (r.bits >= 64 || r.overflow) {
+    r.overflow = true;
+    r.last_us = micros();
+    return;
   }
   r.data = (r.data << 1) | (bit & 0x1);
   r.bits++;
   r.last_us = micros();
 }
 
-void isr_r1_d0() {
-  handle_bit(g_r1, 0);
-}
+void isr_r1_d0() { handle_bit(g_r1, 0); }
 
-void isr_r1_d1() {
-  handle_bit(g_r1, 1);
-}
+void isr_r1_d1() { handle_bit(g_r1, 1); }
 
 ISR(PCINT2_vect) {
   uint8_t current = PIND;
@@ -94,7 +96,7 @@ void feedback_tick(uint8_t led_pin, uint8_t beep_pin, FeedbackState& fb) {
     return;
   }
   uint32_t now = millis();
-  if (now < fb.next_ms) {
+  if (int32_t(now - fb.next_ms) < 0) {
     return;
   }
   if (fb.allowed) {
@@ -147,7 +149,7 @@ void to_hex(uint64_t value, uint8_t width, char* out, size_t out_len) {
   if (!out || out_len == 0) {
     return;
   }
-  if (width + 1 > out_len) {
+  if (size_t(width) + 1 > out_len) {
     width = static_cast<uint8_t>(out_len - 1);
   }
   for (int i = width - 1; i >= 0; --i) {
@@ -161,6 +163,16 @@ void emit_uid(uint8_t reader_id, uint8_t bits, uint64_t data) {
   if (bits != 26 && bits != 34) {
     return;
   }
+  uint8_t half = bits / 2;
+  auto parity = [](uint64_t v) {
+    uint8_t p = 0;
+    while (v) {
+      p ^= v & 1;
+      v >>= 1;
+    }
+    return p;
+  };
+  if (parity(data >> half) != 0 || parity(data & ((1ULL << half) - 1)) != 1) return;
   uint8_t payload_bits = static_cast<uint8_t>(bits - 2);
   uint64_t payload = (data >> 1) & ((payload_bits == 64) ? ~0ULL : ((1ULL << payload_bits) - 1));
   uint8_t width = static_cast<uint8_t>((payload_bits + 3) / 4);
@@ -174,19 +186,23 @@ void emit_uid(uint8_t reader_id, uint8_t bits, uint64_t data) {
 void handle_uart() {
   static char buf[16];
   static uint8_t idx = 0;
-  while (Serial.available() > 0) {
+  static bool discard = false;
+  uint8_t budget = 32;
+  while (budget-- && Serial.available() > 0) {
     char c = static_cast<char>(Serial.read());
     if (c == '\r' || c == '\n') {
+      if (discard) {
+        discard = false;
+        idx = 0;
+        continue;
+      }
       if (idx == 0) {
         continue;
       }
       buf[idx] = '\0';
       idx = 0;
-      if ((buf[0] == 'P' || buf[0] == 'p') &&
-          (buf[1] == 'I' || buf[1] == 'i') &&
-          (buf[2] == 'N' || buf[2] == 'n') &&
-          (buf[3] == 'G' || buf[3] == 'g') &&
-          buf[4] == '\0') {
+      if ((buf[0] == 'P' || buf[0] == 'p') && (buf[1] == 'I' || buf[1] == 'i') &&
+          (buf[2] == 'N' || buf[2] == 'n') && (buf[3] == 'G' || buf[3] == 'g') && buf[4] == '\0') {
         Serial.println("PONG");
         continue;
       }
@@ -200,7 +216,7 @@ void handle_uart() {
       if (*p == ',' || *p == ':') {
         ++p;
       }
-      int reader = atoi(p);
+      int reader = (*p == '1' || *p == '2') && p[1] == 0 ? *p - '0' : 0;
       if (reader == 1) {
         feedback_start(g_fb1, is_allow);
       } else if (reader == 2) {
@@ -208,33 +224,37 @@ void handle_uart() {
       }
       continue;
     }
-    if (idx + 1 < sizeof(buf)) {
+    if (discard) continue;
+    if (size_t(idx) + 1 < sizeof(buf)) {
       buf[idx++] = c;
     } else {
       idx = 0;
+      discard = true;
     }
   }
 }
 
 bool try_flush_reader(uint8_t reader_id, ReaderState& r) {
-  uint32_t now = micros();
-  if (r.bits == 0) {
-    return false;
+  uint8_t bits = 0;
+  uint64_t data = 0;
+  bool overflow = false;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    uint32_t now = micros();
+    if (r.bits && uint32_t(now - r.last_us) >= kWiegandTimeoutUs) {
+      bits = r.bits;
+      data = r.data;
+      overflow = r.overflow;
+      r.bits = 0;
+      r.data = 0;
+      r.overflow = false;
+    }
   }
-  if (now - r.last_us < kWiegandTimeoutUs) {
-    return false;
-  }
-  noInterrupts();
-  uint8_t bits = r.bits;
-  uint64_t data = r.data;
-  r.bits = 0;
-  r.data = 0;
-  interrupts();
+  if (!bits || overflow) return false;
   emit_uid(reader_id, bits, data);
   return true;
 }
 
-} // namespace
+}  // namespace
 
 void setup() {
   Serial.begin(kBaud);

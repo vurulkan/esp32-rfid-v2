@@ -6,14 +6,29 @@ async function fetchJson(url, options) {
   return await res.json();
 }
 
+let uploadingFirmware = false;
+let savedAuthEnabled = false;
+function showError(error) {
+  const banner = document.getElementById('request-error');
+  if (banner) { banner.textContent = error.message || String(error); banner.classList.remove('is-hidden'); }
+}
+window.addEventListener('unhandledrejection', event => { event.preventDefault(); showError(event.reason); });
 async function fetchWithAuth(url, options) {
-  const opts = options || {};
-  opts.credentials = 'same-origin';
-  const res = await fetch(url, opts);
-  if (res.status === 401) {
-    window.location = '/login';
-  }
-  return res;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20000);
+  try {
+    const res = await fetch(url, { ...(options || {}), credentials: 'same-origin', signal: controller.signal });
+    if (res.status === 401) window.location = '/login';
+    let payload = null;
+    if ((res.headers.get('content-type') || '').includes('application/json')) payload = await res.clone().json();
+    if (!res.ok || payload?.ok === false) {
+      throw new Error(payload?.error || `HTTP ${res.status}`);
+    }
+    return res;
+  } finally { clearTimeout(timeout); }
+}
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
 }
 
 function formatBytes(bytes) {
@@ -41,7 +56,7 @@ function renderUsers(users) {
     return '<em>No users</em>';
   }
   return users.map(u => {
-    return `<div><label class="check"><input type="checkbox" class="user-check" data-uid="${u.uid}"> ${u.uid} - ${u.name} (R1: ${u.relay1 ? 'Y' : 'N'}, R2: ${u.relay2 ? 'Y' : 'N'})</label> <button data-uid="${u.uid}" data-name="${u.name}">Delete</button></div>`;
+    return `<div><label class="check"><input type="checkbox" class="user-check" data-uid="${escapeHtml(u.uid)}"> ${escapeHtml(u.uid)} - ${escapeHtml(u.name)} (R1: ${u.relay1 ? 'Y' : 'N'}, R2: ${u.relay2 ? 'Y' : 'N'})</label> <button data-uid="${escapeHtml(u.uid)}" data-name="${escapeHtml(u.name)}">Delete</button></div>`;
   }).join('');
 }
 
@@ -49,7 +64,7 @@ function renderLogs(logs) {
   if (!logs || logs.length === 0) {
     return '<em>No logs</em>';
   }
-  return logs.map(l => `<div>${l.ts} ${l.msg}</div>`).join('');
+  return logs.map(l => `<div>${l.ts} ${escapeHtml(l.msg)}</div>`).join('');
 }
 
 async function loadStatus() {
@@ -57,6 +72,8 @@ async function loadStatus() {
   const device = data.device || {};
   const memory = data.memory || {};
   const network = data.network || {};
+  const diagnostics = document.getElementById('diagnostics');
+  if (diagnostics) diagnostics.textContent = JSON.stringify({health:data.health,rtc:data.rtc,reader:data.reader,logging:data.logging},null,2);
 
   document.getElementById('device-name').textContent = device.name || '-';
   document.getElementById('device-model').textContent = device.chip_model || '-';
@@ -88,7 +105,7 @@ async function loadUsers() {
     allUsers = allUsers.concat(page);
     total = (typeof data.total === 'number') ? data.total : allUsers.length;
     offset += page.length;
-    if (page.length < limit) {
+    if (page.length === 0) {
       break;
     }
   } while (allUsers.length < total);
@@ -121,6 +138,7 @@ async function loadRfid() {
 
 async function loadSettings() {
   const data = await fetchJson('/settings');
+  savedAuthEnabled = !!data.auth_enabled;
   const rtcEnabled = !!data.rtc_enabled;
   const checkbox = document.getElementById('rtc-enabled');
   checkbox.checked = rtcEnabled;
@@ -128,7 +146,7 @@ async function loadSettings() {
   if (rtcEnabled && data.rtc_time_valid) {
     setRtcStatus('RTC is set.');
   } else if (rtcEnabled) {
-    setRtcStatus('RTC not set.');
+    setRtcStatus(rtcStatusMessage(data.rtc_status));
   } else {
     setRtcStatus('');
   }
@@ -204,6 +222,20 @@ function setRtcConfigVisible(enabled) {
     return;
   }
   section.classList.toggle('is-hidden', !enabled);
+}
+
+function rtcStatusMessage(status) {
+  const messages = {
+    disabled: 'RTC disabled.',
+    unavailable: 'RTC not responding. Check power and I2C wiring.',
+    lost_power: 'RTC oscillator stopped. Check backup battery and set date/time again.',
+    invalid_datetime: 'RTC date/time is invalid. Set it again (2000-2099).',
+    oscillator_disabled: 'RTC battery oscillator is disabled. Re-enable RTC and set date/time.',
+    adjustment_pending: 'A clock adjustment did not finish. Set the date/time again.',
+    busy: 'RTC busy. Try reading again.',
+    ready: 'RTC is set.'
+  };
+  return messages[status] || 'RTC is not ready.';
 }
 
 function setRtcStatus(text) {
@@ -283,8 +315,9 @@ async function setRelayState(relayId, enabled, confirmToggle) {
 }
 
 async function fetchLastUid() {
-  const data = await fetchJson('/rfid');
+  const [data, status] = await Promise.all([fetchJson('/rfid'), fetchJson('/status')]);
   const uid = data && data.rfid ? data.rfid.uid : '';
+  if (((status.device.uptime_ms - (data.rfid?.ts || 0)) >>> 0) > 30000) throw new Error('Scan a card again.');
   if (!uid) {
     throw new Error('no uid');
   }
@@ -481,7 +514,7 @@ document.getElementById('rtc-save').addEventListener('click', async () => {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: params.toString()
     });
-    setRtcStatus(enabled ? 'RTC enabled.' : 'RTC disabled.');
+    await loadSettings();
   } catch (err) {
     setRtcStatus('Failed to update settings.');
   }
@@ -514,7 +547,12 @@ document.getElementById('rtc-set').addEventListener('click', async () => {
 
 document.getElementById('rtc-read').addEventListener('click', async () => {
   try {
-    const data = await fetchJson('/rtc');
+    const res = await fetchWithAuth('/rtc');
+    const data = await res.json();
+    if (!res.ok || data.ok === false) {
+      setRtcStatus(rtcStatusMessage(data.error));
+      return;
+    }
     if (data.datetime) {
       const iso = data.datetime.replace(' ', 'T').slice(0, 16);
       document.getElementById('rtc-datetime').value = iso;
@@ -545,6 +583,7 @@ document.getElementById('wifi-save').addEventListener('click', async () => {
   params.set('wifi_client', enabled ? '1' : '0');
   params.set('wifi_ssid', ssid);
   params.set('wifi_pass', pass);
+  params.set('wifi_pass_clear', document.getElementById('wifi-pass-clear').checked ? '1' : '0');
   params.set('wifi_static', useStatic ? '1' : '0');
   params.set('wifi_ip', ip);
   params.set('wifi_gateway', gateway);
@@ -694,7 +733,7 @@ document.getElementById('save-auth').addEventListener('click', async () => {
   const enabled = document.getElementById('auth-enabled').checked;
   const user = document.getElementById('auth-user').value.trim();
   const pass = document.getElementById('auth-pass').value;
-  if (enabled && (!user || !pass)) {
+  if (enabled && (!user || (!savedAuthEnabled && !pass))) {
     alert('Username and password are required.');
     return;
   }
@@ -781,11 +820,17 @@ document.getElementById('restore-apply').addEventListener('click', async () => {
   const file = fileInput.files[0];
   const data = await file.text();
   try {
-    const res = await fetchWithAuth('/restore', {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain' },
-      body: data
-    });
+    const hasUsers = data.includes('[users]');
+    const hasSettings = data.includes('[settings]');
+
+    let options;
+    if (hasUsers) {
+      const formData = new FormData(); formData.append('users', file);
+      options = { method:'POST', body:formData };
+    } else {
+      options = { method:'POST', headers:{'Content-Type':'text/plain'}, body:data };
+    }
+    const res = await fetchWithAuth('/restore', options);
     const payload = await res.json();
     if (!res.ok || payload.ok === false) {
       status.textContent = 'Restore failed.';
@@ -794,22 +839,20 @@ document.getElementById('restore-apply').addEventListener('click', async () => {
     status.textContent = 'Restore complete. Reboot if needed.';
     await refreshAll();
   } catch (err) {
-    status.textContent = 'Restore failed.';
+    status.textContent = `Restore failed: ${err.message}`;
   }
 });
 
-refreshAll();
-setInterval(loadStatus, 2000);
-setInterval(loadRfid, 1500);
-setInterval(() => {
-  if (isPageActive('logs')) {
-    loadLogs();
-  }
-}, 1200);
-
-window.addEventListener('beforeunload', () => {
-  clearApiKey();
-});
+const runningPolls = new Set();
+async function poll(fn) {
+  if (uploadingFirmware || document.hidden || runningPolls.has(fn)) return;
+  runningPolls.add(fn);
+  try { await fn(); } catch (error) { showError(error); } finally { runningPolls.delete(fn); }
+}
+refreshAll().catch(showError);
+setInterval(() => poll(loadStatus), 2000);
+setInterval(() => poll(loadRfid), 1500);
+setInterval(() => { if (isPageActive('logs')) poll(loadLogs); }, 3000);
 
 document.getElementById('firmware-upload').addEventListener('click', () => {
   const fileInput = document.getElementById('firmware-file');
@@ -828,6 +871,8 @@ document.getElementById('firmware-upload').addEventListener('click', () => {
     return;
   }
 
+  if (uploadingFirmware) return;
+  uploadingFirmware = true;
   progressWrap.classList.remove('is-hidden');
   bar.style.width = '0%';
   pct.textContent = '0%';
@@ -846,6 +891,7 @@ document.getElementById('firmware-upload').addEventListener('click', () => {
     }
   });
 
+  xhr.addEventListener('loadend', () => { uploadingFirmware = false; });
   xhr.addEventListener('load', () => {
     try {
       const payload = JSON.parse(xhr.responseText);

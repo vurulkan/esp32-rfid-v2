@@ -1,0 +1,49 @@
+{
+  "firmware_version": "2.0.0",
+  "generated_at_utc": "2026-11-19T21:48:13.225447+00:00",
+  "source_head": "afded6832854d6eb6c6f87f8edde3f387f042e06",
+  "source_state": "uncommitted working tree, including prior user/session changes",
+  "source_manifest_sha256": "8efeea49ee89bf05190281969d691803bca1d0cd91820924e567b8c23a6de686",
+  "esp32": {
+    "board": "esp32dev / ESP32-WROOM-32E 4 MB",
+    "platform": "espressif32@6.12.0",
+    "arduino_core": "2.0.17",
+    "partition_table": "default.csv",
+    "ota_app_slot_bytes": 1310720,
+    "filesystem_bytes": 1441792,
+    "flash_program_bytes": 958025,
+    "static_ram_bytes": 85196,
+    "image_checksum": "valid",
+    "image_validation_hash": "valid",
+    "upload_target": "existing web /firmware endpoint; application only; preserves filesystem and partition table"
+  },
+  "nano": {
+    "platform": "atmelavr@5.1.0",
+    "board": "nanoatmega328",
+    "flash_program_bytes": 4212,
+    "static_ram_bytes": 275,
+    "upload": "optional USB/serial Nano update; not ESP32 OTA"
+  },
+  "validation": {
+    "python_tests_passed": 41,
+    "node_tests_passed": 3,
+    "sanitizers": "AddressSanitizer and UndefinedBehaviorSanitizer on native C++ tests",
+    "esp32_build": "passed",
+    "nano_build": "passed",
+    "git_diff_check": "passed",
+    "hardware_tested": false,
+    "device_uploaded": false
+  },
+  "artifacts": [
+    {
+      "file": "esp32-rfid-v2-2.0.0-ota.bin",
+      "bytes": 964608,
+      "sha256": "75a9491a735df86d9752632f82b34be712a196f443a685a6c1c9a4404445e2dc"
+    },
+    {
+      "file": "wiegand-nano-2.0.0.hex",
+      "bytes": 11869,
+      "sha256": "3603777d19ed717635b003c9a064974b9bf1e1d199f1d9f02c71663d7af55ce4"
+    }
+  ]
+}

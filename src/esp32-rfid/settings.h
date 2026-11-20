@@ -29,6 +29,14 @@ struct Settings {
   char api_key[40];
 };
 
+bool settings_ready();
+bool settings_validate(const Settings& s);
+bool settings_apply(const Settings& s);
+bool settings_parse_text(const String& text, Settings* out);
+String settings_encode(const Settings& s);
+void settings_publish_committed(const Settings& s);
+uint32_t settings_auth_revision();
+String settings_export();
 void settings_init();
 bool settings_load();
 bool settings_save();
@@ -42,4 +50,4 @@ bool settings_set_relay_state(uint8_t relay_id, bool enabled);
 bool settings_set_relay_pulse_ms(uint32_t duration_ms);
 bool settings_set_auth(bool enabled, const char* user, const char* pass, const char* api_key);
 
-} // namespace app
+}  // namespace app

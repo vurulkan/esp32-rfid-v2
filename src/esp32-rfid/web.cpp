@@ -6,12 +6,22 @@
 #include <Update.h>
 #include <esp_system.h>
 #include <cstring>
+#include <algorithm>
+#include <unistd.h>
 
 #include "messages.h"
+#include "storage.h"
+#include "validation.h"
+#include "users.h"
+#include "relay.h"
+#include "logic.h"
+#include <esp_timer.h>
+#include <esp_heap_caps.h>
+#include "log.h"
 #include "reader_uart.h"
 #include "rtc.h"
 #include "settings.h"
-#include "wifi.h"
+#include "app_wifi.h"
 #include "web/app.js.gz.h"
 #include "web/index.html.gz.h"
 #include "web/login.html.gz.h"
@@ -31,7 +41,8 @@ constexpr size_t kMaxSessions = 4;
 struct SessionEntry {
   bool in_use = false;
   char token[33] = {0};
-  uint32_t expires_at = 0;
+  uint64_t last_seen_ms = 0;
+  uint32_t revision = 0;
 };
 
 SessionEntry g_sessions[kMaxSessions];
@@ -40,18 +51,40 @@ bool logic_request(AppQueues* queues, LogicRequest& req, LogicResponse* out, uin
   if (!queues || !queues->logic_queue || !out) {
     return false;
   }
-  QueueHandle_t reply = xQueueCreate(1, sizeof(LogicResponse));
+  // The web task owns this queue for its entire lifetime. A timed-out request
+  // may still finish; its response is identified and discarded by request_id.
+  bool user = req.type == LogicRequestType::GetUsers || req.type == LogicRequestType::AddUser ||
+              req.type == LogicRequestType::DeleteUser ||
+              req.type == LogicRequestType::RestoreUsers;
+  static QueueHandle_t replies[2] = {nullptr, nullptr};
+  QueueHandle_t& reply = replies[user ? 1 : 0];
+  if (!reply) reply = xQueueCreate(1, sizeof(LogicResponse));
+  static uint32_t next_id = 0;
   if (!reply) {
     return false;
   }
+  while (xQueueReceive(reply, out, 0) == pdTRUE) {
+  }
   req.reply_queue = reply;
-  if (xQueueSend(queues->logic_queue, &req, pdMS_TO_TICKS(50)) != pdTRUE) {
-    vQueueDelete(reply);
+  req.request_id = ++next_id;
+  if (!req.request_id) req.request_id = ++next_id;
+  req.deadline_ms = millis() + timeout_ms;
+  if (xQueueSend(user ? queues->user_queue : queues->logic_queue, &req, pdMS_TO_TICKS(50)) !=
+      pdTRUE) {
+    req.request_id = 0;
     return false;
   }
-  bool ok = (xQueueReceive(reply, out, pdMS_TO_TICKS(timeout_ms)) == pdTRUE);
-  vQueueDelete(reply);
-  return ok;
+  const TickType_t started = xTaskGetTickCount();
+  const TickType_t timeout = pdMS_TO_TICKS(timeout_ms);
+  for (;;) {
+    const TickType_t elapsed = xTaskGetTickCount() - started;
+    if (elapsed >= timeout || xQueueReceive(reply, out, timeout - elapsed) != pdTRUE) {
+      return false;
+    }
+    if (out->request_id == req.request_id) {
+      return true;
+    }
+  }
 }
 
 void send_gzip(WebServer& server, const char* content_type, const uint8_t* data, size_t len) {
@@ -68,9 +101,7 @@ bool parse_bool_arg(WebServer& server, const char* name, bool default_value) {
   return val == "1" || val == "true" || val == "yes";
 }
 
-bool is_auth_enabled() {
-  return settings_get().auth_enabled;
-}
+bool is_auth_enabled() { return settings_get().auth_enabled; }
 
 bool check_api_key(WebServer& server) {
   auto settings = settings_get();
@@ -112,7 +143,7 @@ void clear_sessions() {
   for (size_t i = 0; i < kMaxSessions; ++i) {
     g_sessions[i].in_use = false;
     g_sessions[i].token[0] = '\0';
-    g_sessions[i].expires_at = 0;
+    g_sessions[i].last_seen_ms = 0;
   }
 }
 
@@ -147,20 +178,21 @@ bool session_valid(const char* token, bool refresh) {
   if (!token || token[0] == '\0') {
     return false;
   }
-  uint32_t now = millis();
+  uint64_t now = esp_timer_get_time() / 1000;
   for (size_t i = 0; i < kMaxSessions; ++i) {
     if (!g_sessions[i].in_use) {
       continue;
     }
-    if (g_sessions[i].expires_at != 0 && now > g_sessions[i].expires_at) {
+    if (g_sessions[i].revision != settings_auth_revision() ||
+        now - g_sessions[i].last_seen_ms >= kAuthTimeoutMs) {
       g_sessions[i].in_use = false;
       g_sessions[i].token[0] = '\0';
-      g_sessions[i].expires_at = 0;
+      g_sessions[i].last_seen_ms = 0;
       continue;
     }
     if (strncmp(g_sessions[i].token, token, sizeof(g_sessions[i].token)) == 0) {
       if (refresh) {
-        g_sessions[i].expires_at = now + kAuthTimeoutMs;
+        g_sessions[i].last_seen_ms = now;
       }
       return true;
     }
@@ -169,12 +201,13 @@ bool session_valid(const char* token, bool refresh) {
 }
 
 bool check_session(WebServer& server, bool refresh) {
+  if (!settings_ready()) return false;
   auto settings = settings_get();
   if (!settings.auth_enabled) {
     return true;
   }
   if (strlen(settings.auth_user) == 0 || strlen(settings.auth_pass) == 0) {
-    return true;
+    return false;
   }
   char token[40] = {0};
   if (!extract_cookie_token(server, token, sizeof(token))) {
@@ -184,12 +217,13 @@ bool check_session(WebServer& server, bool refresh) {
 }
 
 bool check_auth(WebServer& server) {
+  if (!settings_ready()) return false;
   auto settings = settings_get();
   if (!settings.auth_enabled) {
     return true;
   }
   if (strlen(settings.auth_user) == 0 || strlen(settings.auth_pass) == 0) {
-    return true;
+    return false;
   }
   if (check_api_key(server)) {
     return true;
@@ -215,7 +249,7 @@ void send_unauthorized(WebServer& server, const char* content_type, const char* 
 void issue_session(WebServer& server) {
   char token[33] = {0};
   generate_api_key(token, sizeof(token));
-  uint32_t now = millis();
+  uint64_t now = esp_timer_get_time() / 1000;
   size_t slot = kMaxSessions;
   for (size_t i = 0; i < kMaxSessions; ++i) {
     if (!g_sessions[i].in_use) {
@@ -229,549 +263,412 @@ void issue_session(WebServer& server) {
   g_sessions[slot].in_use = true;
   strncpy(g_sessions[slot].token, token, sizeof(g_sessions[slot].token) - 1);
   g_sessions[slot].token[sizeof(g_sessions[slot].token) - 1] = '\0';
-  g_sessions[slot].expires_at = now + kAuthTimeoutMs;
+  g_sessions[slot].last_seen_ms = now;
+  g_sessions[slot].revision = settings_auth_revision();
   send_login_cookie(server, token);
 }
 
-String settings_to_text() {
-  auto settings = settings_get();
-  String out;
-  out += "rtc=";
-  out += settings.rtc_enabled ? "1" : "0";
-  out += "\nrtc_valid=";
-  out += settings.rtc_time_valid ? "1" : "0";
-  out += "\nwifi_client=";
-  out += settings.wifi_client ? "1" : "0";
-  out += "\nwifi_ssid=";
-  out += settings.wifi_ssid;
-  out += "\nwifi_pass=";
-  out += settings.wifi_pass;
-  out += "\nwifi_static=";
-  out += settings.wifi_static ? "1" : "0";
-  out += "\nwifi_ip=";
-  out += settings.wifi_ip;
-  out += "\nwifi_gateway=";
-  out += settings.wifi_gateway;
-  out += "\nwifi_mask=";
-  out += settings.wifi_mask;
-  out += "\nrelay1=";
-  out += settings.relay1_name;
-  out += "\nrelay2=";
-  out += settings.relay2_name;
-  out += "\nrelay1_state=";
-  out += settings.relay1_state ? "1" : "0";
-  out += "\nrelay2_state=";
-  out += settings.relay2_state ? "1" : "0";
-  out += "\nrelay_pulse_ms=";
-  out += settings.relay_pulse_ms;
-  out += "\nauth_enabled=";
-  out += settings.auth_enabled ? "1" : "0";
-  out += "\nauth_user=";
-  out += settings.auth_user;
-  out += "\nauth_pass=";
-  out += settings.auth_pass;
-  out += "\napi_key=";
-  out += settings.api_key;
-  out += '\n';
-  return out;
+bool require_auth(WebServer& server) {
+  if (check_auth(server)) return true;
+  send_unauthorized(server, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
+  return false;
 }
-
-bool apply_settings_text(const String& text) {
-  Settings settings = settings_get();
-  int start = 0;
-  while (start < text.length()) {
-    int end = text.indexOf('\n', start);
-    if (end < 0) {
-      end = text.length();
-    }
-    String line = text.substring(start, end);
-    line.trim();
-    start = end + 1;
-    if (line.length() == 0) {
-      continue;
-    }
-    if (line.startsWith("rtc=")) {
-      String value = line.substring(4);
-      value.trim();
-      settings.rtc_enabled = (value == "1" || value == "true" || value == "yes");
-    } else if (line.startsWith("rtc_valid=")) {
-      String value = line.substring(10);
-      value.trim();
-      settings.rtc_time_valid = (value == "1" || value == "true" || value == "yes");
-    } else if (line.startsWith("wifi_client=")) {
-      String value = line.substring(12);
-      value.trim();
-      settings.wifi_client = (value == "1" || value == "true" || value == "yes");
-    } else if (line.startsWith("wifi_ssid=")) {
-      String value = line.substring(10);
-      value.trim();
-      value.toCharArray(settings.wifi_ssid, sizeof(settings.wifi_ssid));
-    } else if (line.startsWith("wifi_pass=")) {
-      String value = line.substring(10);
-      value.trim();
-      value.toCharArray(settings.wifi_pass, sizeof(settings.wifi_pass));
-    } else if (line.startsWith("wifi_static=")) {
-      String value = line.substring(12);
-      value.trim();
-      settings.wifi_static = (value == "1" || value == "true" || value == "yes");
-    } else if (line.startsWith("wifi_ip=")) {
-      String value = line.substring(8);
-      value.trim();
-      value.toCharArray(settings.wifi_ip, sizeof(settings.wifi_ip));
-    } else if (line.startsWith("wifi_gateway=")) {
-      String value = line.substring(13);
-      value.trim();
-      value.toCharArray(settings.wifi_gateway, sizeof(settings.wifi_gateway));
-    } else if (line.startsWith("wifi_mask=")) {
-      String value = line.substring(10);
-      value.trim();
-      value.toCharArray(settings.wifi_mask, sizeof(settings.wifi_mask));
-    } else if (line.startsWith("relay1=")) {
-      String value = line.substring(7);
-      value.trim();
-      value.toCharArray(settings.relay1_name, sizeof(settings.relay1_name));
-    } else if (line.startsWith("relay2=")) {
-      String value = line.substring(7);
-      value.trim();
-      value.toCharArray(settings.relay2_name, sizeof(settings.relay2_name));
-    } else if (line.startsWith("relay1_state=")) {
-      String value = line.substring(13);
-      value.trim();
-      settings.relay1_state = (value == "1" || value == "true" || value == "yes");
-    } else if (line.startsWith("relay2_state=")) {
-      String value = line.substring(13);
-      value.trim();
-      settings.relay2_state = (value == "1" || value == "true" || value == "yes");
-    } else if (line.startsWith("relay_pulse_ms=")) {
-      String value = line.substring(15);
-      value.trim();
-      long parsed = value.toInt();
-      uint32_t duration = parsed > 0 ? static_cast<uint32_t>(parsed) : 0;
-      if (duration < kMinRelayPulseMs) {
-        duration = kMinRelayPulseMs;
-      } else if (duration > kMaxRelayPulseMs) {
-        duration = kMaxRelayPulseMs;
-      }
-      settings.relay_pulse_ms = duration;
-    } else if (line.startsWith("auth_enabled=")) {
-      String value = line.substring(13);
-      value.trim();
-      settings.auth_enabled = (value == "1" || value == "true" || value == "yes");
-    } else if (line.startsWith("auth_user=")) {
-      String value = line.substring(10);
-      value.trim();
-      value.toCharArray(settings.auth_user, sizeof(settings.auth_user));
-    } else if (line.startsWith("auth_pass=")) {
-      String value = line.substring(10);
-      value.trim();
-      value.toCharArray(settings.auth_pass, sizeof(settings.auth_pass));
-    } else if (line.startsWith("api_key=")) {
-      String value = line.substring(8);
-      value.trim();
-      value.toCharArray(settings.api_key, sizeof(settings.api_key));
-    }
-  }
-
-  bool ok = settings_set_rtc_enabled(settings.rtc_enabled);
-  if (!ok) {
-    return false;
-  }
-  settings_set_rtc_valid(settings.rtc_time_valid);
-  settings_set_wifi(settings.wifi_client, settings.wifi_ssid, settings.wifi_pass);
-  settings_set_wifi_static(settings.wifi_static, settings.wifi_ip, settings.wifi_gateway, settings.wifi_mask);
-  settings_set_relay_names(settings.relay1_name, settings.relay2_name);
-  settings_set_relay_state(1, settings.relay1_state);
-  settings_set_relay_state(2, settings.relay2_state);
-  settings_set_relay_pulse_ms(settings.relay_pulse_ms);
-  settings_set_auth(settings.auth_enabled, settings.auth_user, settings.auth_pass, settings.api_key);
-  rtc_init(settings.rtc_enabled);
-  rtc_set_time_valid(settings.rtc_time_valid);
+void result(WebServer& server, bool ok, const char* error = "operation_failed") {
+  String json = ok ? "{\"ok\":true}" : String("{\"ok\":false,\"error\":") + json_quote(error) + "}";
+  server.send(ok ? 200 : 400, "application/json", json);
+}
+bool section(const String& body, const char* key, String* out) {
+  String begin = String("[") + key + "]", end = String("[/") + key + "]";
+  int a = body.indexOf(begin), b = a < 0 ? -1 : body.indexOf(end, a + begin.length());
+  if (a < 0 || b < 0) return false;
+  *out = body.substring(a + begin.length(), b);
+  if (out->startsWith("\r\n"))
+    out->remove(0, 2);
+  else if (out->startsWith("\n"))
+    out->remove(0, 1);
   return true;
 }
-
-String extract_section(const String& body, const char* name) {
-  String open = "[";
-  open += name;
-  open += "]";
-  String close = "[/";
-  close += name;
-  close += "]";
-  int start = body.indexOf(open);
-  if (start < 0) {
-    return "";
+bool boolean_arg(WebServer& server, const char* key, bool* value) {
+  if (!server.hasArg(key)) return true;
+  String v = server.arg(key);
+  if (v == "1" || v == "true" || v == "yes") {
+    *value = true;
+    return true;
   }
-  start += open.length();
-  int end = body.indexOf(close, start);
-  if (end < 0) {
-    return "";
+  if (v == "0" || v == "false" || v == "no") {
+    *value = false;
+    return true;
   }
-  String section = body.substring(start, end);
-  section.trim();
-  return section;
+  return false;
 }
-
-String read_file_or_empty(const char* path) {
-  if (!LittleFS.begin()) {
-    return "";
-  }
-  if (!LittleFS.exists(path)) {
-    return "";
-  }
-  File file = LittleFS.open(path, FILE_READ);
-  if (!file) {
-    return "";
-  }
-  String out;
-  while (file.available()) {
-    out += static_cast<char>(file.read());
-  }
-  file.close();
-  return out;
-}
-
-bool write_file_text(const char* path, const String& data) {
-  if (!LittleFS.begin()) {
-    return false;
-  }
-  File file = LittleFS.open(path, FILE_WRITE);
-  if (!file) {
-    return false;
-  }
-  file.print(data);
-  file.close();
+bool text_arg(WebServer& server, const char* key, char* out, size_t capacity) {
+  if (!server.hasArg(key)) return true;
+  String v = server.arg(key);
+  if (!valid_field(v.c_str(), capacity, false) || strlen(v.c_str()) != v.length()) return false;
+  v.toCharArray(out, capacity);
   return true;
 }
-
-} // namespace
+bool uint_arg(WebServer& server, const char* key, uint32_t* value, uint32_t min, uint32_t max) {
+  if (!server.hasArg(key)) return true;
+  String v = server.arg(key);
+  if (!v.length() || v.length() > 10) return false;
+  uint64_t n = 0;
+  for (size_t i = 0; i < v.length(); ++i) {
+    if (v[i] < '0' || v[i] > '9') return false;
+    n = n * 10 + v[i] - '0';
+    if (n > max) return false;
+  }
+  if (n < min) return false;
+  *value = n;
+  return true;
+}
+void send_logic(WebServer& server, AppQueues* queues, LogicRequest& req, uint32_t timeout = 2000) {
+  static LogicResponse resp;
+  if (!logic_request(queues, req, &resp, timeout)) {
+    server.send(504, "application/json", "{\"ok\":false,\"error\":\"request_timeout\"}");
+    return;
+  }
+  server.send(resp.ok ? 200 : 400, "application/json", resp.json);
+}
+void stream_files(WebServer& server, const String& prefix, const std::vector<String>& paths,
+                  const String& suffix) {
+  StorageLock lock;
+  if (!lock || !storage_ready()) {
+    result(server, false, "storage_unavailable");
+    return;
+  }
+  size_t total = prefix.length() + suffix.length();
+  for (const auto& path : paths) {
+    File f = LittleFS.open(path.c_str(), FILE_READ);
+    if (!f) {
+      result(server, false, "read_failed");
+      return;
+    }
+    total += f.size();
+    f.close();
+  }
+  server.setContentLength(total);
+  server.send(200, "text/plain", "");
+  server.sendContent(prefix);
+  char buf[512];
+  for (const auto& path : paths) {
+    File f = LittleFS.open(path.c_str(), FILE_READ);
+    size_t remaining = f.size();
+    while (remaining) {
+      size_t n = f.readBytes(buf, std::min(remaining, sizeof(buf)));
+      if (!n) break;
+      server.sendContent(buf, n);
+      remaining -= n;
+    }
+    f.close();
+  }
+  server.sendContent(suffix);
+}
+}  // namespace
 
 void web_task(void* param) {
   auto* queues = static_cast<AppQueues*>(param);
   WebServer server(80);
-  const char* header_keys[] = {kApiKeyHeader, kCookieHeader};
-  server.collectHeaders(header_keys, 2);
-
-  Serial.println("Web task starting...");
-  uint32_t waited_ms = 0;
-  while (!wifi_is_ap_ready() && waited_ms < 5000) {
-    vTaskDelay(pdMS_TO_TICKS(200));
-    waited_ms += 200;
-  }
-  if (wifi_is_ap_ready()) {
-    Serial.println("AP event seen, starting web server.");
-  }
-
+  bool ota_started = false, ota_completed = false, ota_failed = false;
+  unsigned ota_parts = 0;
+  FILE* restore_upload = nullptr;
+  String restore_path;
+  bool restore_received = false, restore_failed = false;
+  unsigned restore_parts = 0;
+  size_t restore_size = 0;
+  const char* keys[] = {kApiKeyHeader, kCookieHeader};
+  server.collectHeaders(keys, 2);
+  xEventGroupWaitBits(queues->events, kAppReady, pdFALSE, pdTRUE, portMAX_DELAY);
+  for (uint32_t start = millis();
+       !wifi_is_ap_ready() && !wifi_is_sta_ready() && millis() - start < 5000;)
+    vTaskDelay(pdMS_TO_TICKS(100));
+  auto reject_maintenance = [&]() {
+    if (!app_maintenance()) return false;
+    server.send(503, "application/json", "{\"ok\":false,\"error\":\"maintenance\"}");
+    return true;
+  };
   server.on("/", HTTP_GET, [&]() {
-    Serial.println("HTTP GET /");
-    if (!check_session(server, true)) {
-      send_gzip(server, "text/html", login_html_gz, login_html_gz_len);
-      return;
-    }
-    send_gzip(server, "text/html", index_html_gz, index_html_gz_len);
+    bool logged = check_session(server, true);
+    send_gzip(server, "text/html", logged ? index_html_gz : login_html_gz,
+              logged ? index_html_gz_len : login_html_gz_len);
   });
-
   server.on("/login", HTTP_GET, [&]() {
-    if (!is_auth_enabled()) {
+    if (!is_auth_enabled() || check_session(server, true)) {
       server.sendHeader("Location", "/");
       server.send(302, "text/plain", "");
-      return;
-    }
-    if (check_session(server, true)) {
-      server.sendHeader("Location", "/");
-      server.send(302, "text/plain", "");
-      return;
-    }
-    send_gzip(server, "text/html", login_html_gz, login_html_gz_len);
+    } else
+      send_gzip(server, "text/html", login_html_gz, login_html_gz_len);
   });
-
-  server.on("/app.js", HTTP_GET, [&]() {
-    Serial.println("HTTP GET /app.js");
-    send_gzip(server, "application/javascript", app_js_gz, app_js_gz_len);
-  });
-
-  server.on("/style.css", HTTP_GET, [&]() {
-    Serial.println("HTTP GET /style.css");
-    send_gzip(server, "text/css", style_css_gz, style_css_gz_len);
-  });
-
+  server.on("/app.js", HTTP_GET,
+            [&]() { send_gzip(server, "application/javascript", app_js_gz, app_js_gz_len); });
+  server.on("/style.css", HTTP_GET,
+            [&]() { send_gzip(server, "text/css", style_css_gz, style_css_gz_len); });
   server.on("/auth/login", HTTP_POST, [&]() {
-    if (!is_auth_enabled()) {
-      server.send(400, "application/json", "{\"ok\":false,\"error\":\"auth_disabled\"}");
+    auto s = settings_get();
+    if (!s.auth_enabled) {
+      result(server, false, "auth_disabled");
       return;
     }
-    if (!server.hasArg("user") || !server.hasArg("pass")) {
-      server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing_credentials\"}");
-      return;
-    }
-    String user = server.arg("user");
-    String pass = server.arg("pass");
-    auto settings = settings_get();
-    if (user != settings.auth_user || pass != settings.auth_pass) {
+    if (!s.auth_user[0] || !s.auth_pass[0] || server.arg("user") != s.auth_user ||
+        server.arg("pass") != s.auth_pass) {
       send_unauthorized(server, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
       return;
     }
     issue_session(server);
-    server.send(200, "application/json", "{\"ok\":true}");
+    result(server, true);
   });
-
-  server.on("/auth/logout", HTTP_ANY, [&]() {
+  server.on("/auth/logout", HTTP_POST, [&]() {
     char token[40] = {0};
-    if (extract_cookie_token(server, token, sizeof(token))) {
-      for (size_t i = 0; i < kMaxSessions; ++i) {
-        if (g_sessions[i].in_use && strncmp(g_sessions[i].token, token, sizeof(g_sessions[i].token)) == 0) {
-          g_sessions[i].in_use = false;
-          g_sessions[i].token[0] = '\0';
-          g_sessions[i].expires_at = 0;
-        }
-      }
-    }
+    if (extract_cookie_token(server, token, sizeof(token)))
+      for (auto& session : g_sessions)
+        if (strcmp(session.token, token) == 0) session.in_use = false;
     clear_login_cookie(server);
-    server.send(200, "application/json", "{\"ok\":true}");
+    result(server, true);
   });
-
   server.on("/users", HTTP_ANY, [&]() {
-    Serial.printf("HTTP /users method %d\n", server.method());
-    if (!check_auth(server)) {
-      send_unauthorized(server, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
-      return;
-    }
-    static LogicRequest req;
-    static LogicResponse resp;
-    memset(&req, 0, sizeof(req));
-    memset(&resp, 0, sizeof(resp));
+    if (!require_auth(server) || reject_maintenance()) return;
+    LogicRequest req{};
     if (server.method() == HTTP_GET) {
-      uint16_t offset = server.hasArg("offset") ? static_cast<uint16_t>(server.arg("offset").toInt()) : 0;
-      uint16_t limit = server.hasArg("limit") ? static_cast<uint16_t>(server.arg("limit").toInt()) : 50;
-      if (limit == 0 || limit > 100) {
-        limit = 50;
+      uint32_t offset = 0, limit = 50;
+      if (!uint_arg(server, "offset", &offset, 0, 1000) ||
+          !uint_arg(server, "limit", &limit, 1, 100)) {
+        result(server, false, "invalid_page");
+        return;
       }
       req.type = LogicRequestType::GetUsers;
       req.payload.get_users.offset = offset;
       req.payload.get_users.limit = limit;
-      if (logic_request(queues, req, &resp, 300)) {
-        server.send(200, "application/json", resp.json);
-      } else {
-        server.send(500, "application/json", "{\"ok\":false}");
-      }
-      return;
-    }
-
-    if (server.method() == HTTP_POST) {
-      if (!server.hasArg("uid") || !server.hasArg("name")) {
-        server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing uid or name\"}");
-        return;
-      }
-      String uid = server.arg("uid");
-      String name = server.arg("name");
-      bool relay1 = parse_bool_arg(server, "relay1", false);
-      bool relay2 = parse_bool_arg(server, "relay2", false);
-
+    } else if (server.method() == HTTP_POST) {
       req.type = LogicRequestType::AddUser;
-      strncpy(req.payload.add_user.uid, uid.c_str(), sizeof(req.payload.add_user.uid) - 1);
-      strncpy(req.payload.add_user.name, name.c_str(), sizeof(req.payload.add_user.name) - 1);
-      req.payload.add_user.relay1 = relay1 ? 1 : 0;
-      req.payload.add_user.relay2 = relay2 ? 1 : 0;
-
-      if (logic_request(queues, req, &resp, 300)) {
-        server.send(200, "application/json", resp.json);
-      } else {
-        server.send(500, "application/json", "{\"ok\":false}");
-      }
-      return;
-    }
-
-    if (server.method() == HTTP_DELETE) {
-      if (!server.hasArg("uid")) {
-        server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing uid\"}");
+      String uid = server.arg("uid"), name = server.arg("name");
+      bool a = false, b = false;
+      if (!normalize_uid(uid.c_str(), req.payload.add_user.uid, sizeof(req.payload.add_user.uid)) ||
+          !valid_field(name.c_str(), sizeof(req.payload.add_user.name)) || !name.length() ||
+          !boolean_arg(server, "relay1", &a) || !boolean_arg(server, "relay2", &b)) {
+        result(server, false, "invalid_user");
         return;
       }
-      String uid = server.arg("uid");
+      strcpy(req.payload.add_user.name, name.c_str());
+      req.payload.add_user.relay1 = a;
+      req.payload.add_user.relay2 = b;
+    } else if (server.method() == HTTP_DELETE) {
       req.type = LogicRequestType::DeleteUser;
-      strncpy(req.payload.del_user.uid, uid.c_str(), sizeof(req.payload.del_user.uid) - 1);
-
-      if (logic_request(queues, req, &resp, 300)) {
-        server.send(200, "application/json", resp.json);
-      } else {
-        server.send(500, "application/json", "{\"ok\":false}");
+      if (!normalize_uid(server.arg("uid").c_str(), req.payload.del_user.uid,
+                         sizeof(req.payload.del_user.uid))) {
+        result(server, false, "invalid_uid");
+        return;
       }
-      return;
-    }
-
-    server.send(405, "application/json", "{\"ok\":false,\"error\":\"method not allowed\"}");
-  });
-
-  server.on("/logs", HTTP_ANY, [&]() {
-    Serial.printf("HTTP /logs method %d\n", server.method());
-    if (!check_auth(server)) {
-      send_unauthorized(server, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
-      return;
-    }
-    static LogicRequest req;
-    static LogicResponse resp;
-    memset(&req, 0, sizeof(req));
-    memset(&resp, 0, sizeof(resp));
-    if (server.method() == HTTP_GET) {
-      req.type = LogicRequestType::GetLogs;
-      if (logic_request(queues, req, &resp, 400)) {
-        server.send(200, "application/json", resp.json);
-      } else {
-        server.send(500, "application/json", "{\"ok\":false}");
-      }
-      return;
-    }
-
-    if (server.method() == HTTP_DELETE) {
-      String scope = server.hasArg("scope") ? server.arg("scope") : "all";
-      scope.toLowerCase();
-      req.type = (scope == "ram") ? LogicRequestType::ClearLogsRam : LogicRequestType::ClearLogsAll;
-      if (logic_request(queues, req, &resp, 400)) {
-        server.send(200, "application/json", resp.json);
-      } else {
-        server.send(500, "application/json", "{\"ok\":false}");
-      }
-      return;
-    }
-
-    server.send(405, "application/json", "{\"ok\":false,\"error\":\"method not allowed\"}");
-  });
-
-  server.on("/logs/export", HTTP_GET, [&]() {
-    if (!check_auth(server)) {
-      send_unauthorized(server, "text/plain", "unauthorized");
-      return;
-    }
-    if (!LittleFS.begin() || !LittleFS.exists("/logs.txt")) {
-      server.send(200, "text/plain", "");
-      return;
-    }
-    File file = LittleFS.open("/logs.txt", FILE_READ);
-    if (!file) {
-      server.send(500, "text/plain", "");
-      return;
-    }
-    server.streamFile(file, "text/plain");
-    file.close();
-  });
-
-  server.on("/rfid", HTTP_GET, [&]() {
-    Serial.println("HTTP GET /rfid");
-    if (!check_auth(server)) {
-      send_unauthorized(server, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
-      return;
-    }
-    static LogicRequest req;
-    static LogicResponse resp;
-    memset(&req, 0, sizeof(req));
-    memset(&resp, 0, sizeof(resp));
-    req.type = LogicRequestType::GetLastRfid;
-    if (logic_request(queues, req, &resp, 200)) {
-      server.send(200, "application/json", resp.json);
     } else {
-      server.send(500, "application/json", "{\"ok\":false}");
+      server.send(405, "application/json", "{\"ok\":false}");
+      return;
     }
+    send_logic(server, queues, req, 10000);
   });
-
+  server.on("/logs", HTTP_ANY, [&]() {
+    if (!require_auth(server) || reject_maintenance()) return;
+    LogicRequest req{};
+    if (server.method() == HTTP_GET)
+      req.type = LogicRequestType::GetLogs;
+    else if (server.method() == HTTP_DELETE) {
+      String scope = server.hasArg("scope") ? server.arg("scope") : "all";
+      if (scope != "all" && scope != "ram") {
+        result(server, false, "invalid_scope");
+        return;
+      }
+      req.type = scope == "ram" ? LogicRequestType::ClearLogsRam : LogicRequestType::ClearLogsAll;
+    } else {
+      server.send(405, "application/json", "{\"ok\":false}");
+      return;
+    }
+    send_logic(server, queues, req);
+  });
+  server.on("/logs/export", HTTP_GET, [&]() {
+    if (!require_auth(server) || reject_maintenance()) return;
+    if (!log_flush(5000)) {
+      result(server, false, "log_flush_timeout");
+      return;
+    }
+    StorageLock lock;
+    stream_files(server, "", log_files(), "");
+  });
+  server.on("/rfid", HTTP_GET, [&]() {
+    if (!require_auth(server)) return;
+    LogicRequest req{};
+    req.type = LogicRequestType::GetLastRfid;
+    send_logic(server, queues, req);
+  });
   server.on("/backup", HTTP_GET, [&]() {
-    if (!check_auth(server)) {
-      send_unauthorized(server, "text/plain", "unauthorized");
-      return;
-    }
+    if (!require_auth(server) || reject_maintenance()) return;
     String type = server.hasArg("type") ? server.arg("type") : "full";
-    type.toLowerCase();
-
-    String out;
-    out += kBackupHeader;
-    out += "\n";
-
+    if (type != "users" && type != "settings" && type != "full") {
+      result(server, false, "invalid_type");
+      return;
+    }
+    StorageLock lock;
+    String prefix = "#RFID_BACKUP\n", suffix;
+    std::vector<String> paths;
     if (type == "settings" || type == "full") {
-      out += "[settings]\n";
-      out += settings_to_text();
-      out += "[/settings]\n";
+      prefix += "[settings]\n";
+      prefix += settings_export();
+      prefix += "[/settings]\n";
     }
-
     if (type == "users" || type == "full") {
-      out += "[users]\n";
-      out += read_file_or_empty("/users.txt");
-      out += "[/users]\n";
+      prefix += "[users]\n";
+      suffix = "[/users]\n";
+      if (LittleFS.exists("/users.txt")) paths.push_back("/users.txt");
     }
-
-    server.send(200, "text/plain", out);
+    stream_files(server, prefix, paths, suffix);
   });
-
-  server.on("/restore", HTTP_POST, [&]() {
-    if (!check_auth(server)) {
-      send_unauthorized(server, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
+  auto restore_users = [&](const String& path, const Settings* config = nullptr) {
+    LogicRequest req{};
+    req.type = LogicRequestType::RestoreUsers;
+    if (config) {
+      req.payload.restore_users.has_settings = true;
+      req.payload.restore_users.settings = *config;
+    }
+    path.toCharArray(req.payload.restore_users.path, sizeof(req.payload.restore_users.path));
+    if (!app_prepare_maintenance()) {
+      result(server, false, "maintenance_timeout");
+      StorageLock lock;
+      LittleFS.remove(path.c_str());
       return;
     }
-    if (!server.hasArg("plain")) {
-      server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing body\"}");
-      return;
+    static LogicResponse resp;
+    bool received = logic_request(queues, req, &resp, 15000);
+    if (!received && req.request_id == 0) {
+      StorageLock lock;
+      LittleFS.remove(path.c_str());
+      app_set_maintenance(false);
     }
-    String body = server.arg("plain");
-    String settings_text = extract_section(body, "settings");
-    String users_text = extract_section(body, "users");
-    bool has_sections = settings_text.length() > 0 || users_text.length() > 0;
-
-    if (!has_sections) {
-      server.send(400, "application/json", "{\"ok\":false,\"error\":\"no sections\"}");
-      return;
-    }
-
-    bool ok = true;
-    if (settings_text.length() > 0) {
-      ok = apply_settings_text(settings_text);
-      if (ok) {
-        auto settings = settings_get();
-        static LogicRequest req;
-        static LogicResponse resp;
-        memset(&req, 0, sizeof(req));
-        memset(&resp, 0, sizeof(resp));
-        req.type = LogicRequestType::SetRelayState;
-        req.payload.relay_state.relay_id = 1;
-        req.payload.relay_state.enabled = settings.relay1_state ? 1 : 0;
-        if (!logic_request(queues, req, &resp, 300)) {
-          ok = false;
-        }
-        if (ok) {
-          memset(&req, 0, sizeof(req));
-          memset(&resp, 0, sizeof(resp));
-          req.type = LogicRequestType::SetRelayState;
-          req.payload.relay_state.relay_id = 2;
-          req.payload.relay_state.enabled = settings.relay2_state ? 1 : 0;
-          if (!logic_request(queues, req, &resp, 300)) {
-            ok = false;
+    if (received) {
+      if (resp.ok && settings_get().auth_enabled) issue_session(server);
+      server.send(resp.ok ? 200 : 400, "application/json", resp.json);
+    } else
+      server.send(504, "application/json",
+                  "{\"ok\":false,\"error\":\"restore_pending_or_failed\"}");
+  };
+  server.on(
+      "/restore", HTTP_POST,
+      [&]() {
+        if (!require_auth(server) || reject_maintenance()) return;
+        if (restore_parts) {
+          if (restore_upload) {
+            fclose(restore_upload);
+            restore_upload = nullptr;
+            restore_failed = true;
           }
+          String path = restore_path;
+          bool ok = restore_received && !restore_failed && restore_parts == 1;
+          restore_parts = 0;
+          restore_path = "";
+          if (!ok) {
+            StorageLock lock;
+            if (path.length()) LittleFS.remove(path.c_str());
+            result(server, false, "invalid_upload");
+            return;
+          }
+          restore_users(path);
+          return;
         }
-      }
-    }
-
-    if (ok && users_text.length() > 0) {
-      ok = write_file_text("/users.txt", users_text);
-      if (ok) {
-        static LogicRequest req;
-        static LogicResponse resp;
-        memset(&req, 0, sizeof(req));
-        memset(&resp, 0, sizeof(resp));
-        req.type = LogicRequestType::ReloadUsers;
-        if (!logic_request(queues, req, &resp, 1000)) {
-          ok = false;
+        String body = server.arg("plain");
+        if (body.length() > 65536 || strlen(body.c_str()) != body.length()) {
+          result(server, false, "backup_too_large");
+          return;
         }
-      }
-    }
-
-    server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
-  });
-
+        String users, settings;
+        bool has_users = section(body, "users", &users),
+             has_settings = section(body, "settings", &settings);
+        Settings bundle_settings = settings_get();
+        if (has_settings && !settings_parse_text(settings, &bundle_settings)) {
+          result(server, false, "invalid_settings_backup");
+          return;
+        }
+        if (has_settings && !has_users) {
+          StorageLock lock;
+          Settings candidate = settings_get();
+          if (!settings_parse_text(settings, &candidate)) {
+            result(server, false, "invalid_settings_backup");
+            return;
+          }
+          Settings old = settings_get();
+          bool ok = settings_apply(candidate);
+          if (ok) {
+            clear_sessions();
+            if (candidate.auth_enabled) issue_session(server);
+            rtc_init(candidate.rtc_enabled);
+            relay_set_state(1, candidate.relay1_state);
+            relay_set_state(2, candidate.relay2_state);
+          }
+          result(server, ok);
+          return;
+        }
+        if (has_users) {
+          char name[40];
+          snprintf(name, sizeof(name), "/restore-%08lx.txt", (unsigned long)esp_random());
+          if (!storage_write_text(name, users)) {
+            result(server, false, "stage_failed");
+            return;
+          }
+          restore_users(name, has_settings ? &bundle_settings : nullptr);
+          return;
+        }
+        result(server, false, "no_sections");
+      },
+      [&]() {
+        if (!check_auth(server) || app_maintenance()) return;
+        HTTPUpload& upload = server.upload();
+        if (upload.status == UPLOAD_FILE_START) {
+          if (++restore_parts != 1) {
+            restore_failed = true;
+            return;
+          }
+          restore_failed = false;
+          restore_received = false;
+          restore_size = 0;
+          char name[40];
+          snprintf(name, sizeof(name), "/restore-%08lx.txt", (unsigned long)esp_random());
+          restore_path = name;
+          StorageLock lock;
+          restore_upload = storage_ready()
+                               ? fopen((String(RFID_FS_ROOT) + restore_path).c_str(), "wb")
+                               : nullptr;
+          if (!restore_upload) restore_failed = true;
+        } else if (upload.status == UPLOAD_FILE_WRITE) {
+          restore_size += upload.currentSize;
+          if (restore_size > 96000) restore_failed = true;
+          if (restore_upload && !restore_failed) {
+            StorageLock lock;
+            if (fwrite(upload.buf, 1, upload.currentSize, restore_upload) != upload.currentSize)
+              restore_failed = true;
+          }
+        } else if (upload.status == UPLOAD_FILE_END) {
+          if (restore_upload) {
+            StorageLock lock;
+            if (fflush(restore_upload) != 0 || fsync(fileno(restore_upload)) != 0)
+              restore_failed = true;
+            if (fclose(restore_upload) != 0) restore_failed = true;
+            restore_upload = nullptr;
+          }
+          restore_received = !restore_failed;
+        } else if (upload.status == UPLOAD_FILE_ABORTED) {
+          StorageLock lock;
+          if (restore_upload) fclose(restore_upload);
+          restore_upload = nullptr;
+          LittleFS.remove(restore_path.c_str());
+          restore_path = "";
+          restore_parts = 0;
+          restore_failed = true;
+        }
+      });
   server.on("/status", HTTP_GET, [&]() {
-    Serial.println("HTTP GET /status");
-    if (!check_auth(server)) {
-      send_unauthorized(server, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
-      return;
-    }
-    String json = "{\"device\":{";
-    json += "\"name\":\"esp32-rfid\",";
-    json += "\"chip_model\":\"";
-    json += ESP.getChipModel();
-    json += "\",\"chip_rev\":";
+    if (!require_auth(server)) return;
+    RtcDateTime dt{};
+    bool valid = rtc_get_datetime(&dt);
+    StorageLock lock;
+    bool sta = WiFi.status() == WL_CONNECTED;
+    String json = "{\"device\":{\"name\":\"esp32-rfid\",\"firmware\":\"2.0.1\",\"chip_model\":";
+    json += json_quote(ESP.getChipModel());
+    json += ",\"chip_rev\":";
     json += ESP.getChipRevision();
     json += ",\"cores\":";
     json += ESP.getChipCores();
@@ -779,9 +676,14 @@ void web_task(void* param) {
     json += ESP.getCpuFreqMHz();
     json += ",\"uptime_ms\":";
     json += millis();
-    json += "},\"memory\":{";
-    json += "\"heap_free\":";
+    json += ",\"reset_reason\":";
+    json += int(esp_reset_reason());
+    json += "},\"memory\":{\"heap_free\":";
     json += ESP.getFreeHeap();
+    json += ",\"heap_min\":";
+    json += ESP.getMinFreeHeap();
+    json += ",\"heap_largest\":";
+    json += heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     json += ",\"heap_total\":";
     json += ESP.getHeapSize();
     json += ",\"flash_total\":";
@@ -791,393 +693,368 @@ void web_task(void* param) {
     json += ",\"littlefs_total\":";
     json += LittleFS.totalBytes();
     json += ",\"littlefs_free\":";
-    json += LittleFS.usedBytes() > LittleFS.totalBytes() ? 0 : (LittleFS.totalBytes() - LittleFS.usedBytes());
-    json += "},\"network\":{";
-    bool sta = (WiFi.getMode() == WIFI_STA);
-    json += "\"mode\":\"";
-    json += sta ? "CLIENT" : "AP";
-    json += "\",\"ssid\":\"";
-    json += sta ? WiFi.SSID() : WiFi.softAPSSID();
-    json += "\",\"ip\":\"";
-    json += sta ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
-    json += "\",\"gateway\":\"";
-    json += sta ? WiFi.gatewayIP().toString() : WiFi.softAPIP().toString();
-    json += "\",\"mask\":\"";
-    json += sta ? WiFi.subnetMask().toString() : WiFi.softAPSubnetMask().toString();
-    json += "\",\"mac\":\"";
-    json += sta ? WiFi.macAddress() : WiFi.softAPmacAddress();
-    json += "\"}}";
+    json += LittleFS.totalBytes() - LittleFS.usedBytes();
+    auto health = logic_health();
+    json += "},\"health\":{\"logic_heartbeat_ms\":";
+    json += health.heartbeat_ms;
+    json += ",\"max_queue_delay_ms\":";
+    json += health.max_queue_delay_ms;
+    json += ",\"cards_processed\":";
+    json += health.processed;
+    json += ",\"cards_expired\":";
+    json += health.expired;
+    json += ",\"storage\":";
+    json += storage_ready() ? "true" : "false";
+    json += ",\"settings\":";
+    json += settings_ready() ? "true" : "false";
+    json += ",\"users\":";
+    json += users_database().ready() ? "true" : "false";
+    json += ",\"user_capacity\":";
+    json += users_database().capacity();
+    json += ",\"relay\":";
+    json += relay_ready() ? "true" : "false";
+    json += ",\"relay1_gpio\":";
+    json += relay_output_state(1) ? "true" : "false";
+    json += ",\"relay2_gpio\":";
+    json += relay_output_state(2) ? "true" : "false";
+    json += ",\"maintenance\":";
+    json += app_maintenance() ? "true" : "false";
+    json += "},\"rtc\":{\"enabled\":";
+    json += rtc_is_enabled() ? "true" : "false";
+    json += ",\"valid\":";
+    json += valid ? "true" : "false";
+    json += ",\"status\":";
+    json += json_quote(rtc_state_name(rtc_get_state()));
+    json += "},\"logging\":{\"dropped\":";
+    json += log_dropped_writes();
+    json += ",\"errors\":";
+    json += log_write_errors();
+    json += ",\"pending\":";
+    json += log_pending_writes();
+    json += "},\"reader\":{\"received\":";
+    json += uart_received_cards();
+    json += ",\"dropped\":";
+    json += uart_dropped_cards();
+    json += ",\"errors\":";
+    json += uart_receive_errors();
+    json += ",\"invalid\":";
+    json += uart_bad_lines();
+    json += ",\"feedback_dropped\":";
+    json += uart_cmd_drops();
+    json += ",\"last_card_ms\":";
+    json += uart_last_card_ms();
+    json += ",\"last_pong_ms\":";
+    json += uart_last_pong_ms();
+    json += "},\"network\":{\"mode\":";
+    json += json_quote(sta ? "CLIENT" : "AP");
+    json += ",\"ssid\":";
+    json += json_quote((sta ? WiFi.SSID() : WiFi.softAPSSID()).c_str());
+    json += ",\"ip\":";
+    json += json_quote((sta ? WiFi.localIP() : WiFi.softAPIP()).toString().c_str());
+    json += ",\"gateway\":";
+    json += json_quote((sta ? WiFi.gatewayIP() : WiFi.softAPIP()).toString().c_str());
+    json += ",\"mask\":";
+    json += json_quote((sta ? WiFi.subnetMask() : WiFi.softAPSubnetMask()).toString().c_str());
+    json += ",\"mac\":";
+    json += json_quote((sta ? WiFi.macAddress() : WiFi.softAPmacAddress()).c_str());
+    json += "}}";
     server.send(200, "application/json", json);
   });
-
   server.on("/settings", HTTP_ANY, [&]() {
-    if (!check_auth(server)) {
-      send_unauthorized(server, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
-      return;
-    }
+    if (!require_auth(server) || reject_maintenance()) return;
     if (server.method() == HTTP_GET) {
-      auto settings = settings_get();
+      auto s = settings_get();
+      RtcDateTime dt{};
+      bool valid = rtc_get_datetime(&dt);
       String json = "{\"rtc_enabled\":";
-      json += settings.rtc_enabled ? "true" : "false";
+      json += s.rtc_enabled ? "true" : "false";
       json += ",\"rtc_time_valid\":";
-      json += settings.rtc_time_valid ? "true" : "false";
-      json += ",\"wifi_client\":";
-      json += settings.wifi_client ? "true" : "false";
-      json += ",\"wifi_ssid\":\"";
-      json += settings.wifi_ssid;
-      json += "\",\"wifi_static\":";
-      json += settings.wifi_static ? "true" : "false";
-      json += ",\"wifi_ip\":\"";
-      json += settings.wifi_ip;
-      json += "\",\"wifi_gateway\":\"";
-      json += settings.wifi_gateway;
-      json += "\",\"wifi_mask\":\"";
-      json += settings.wifi_mask;
-      json += "\",\"relay1\":\"";
-      json += settings.relay1_name;
-      json += "\",\"relay2\":\"";
-      json += settings.relay2_name;
-      json += "\",\"relay1_state\":";
-      json += settings.relay1_state ? "true" : "false";
-      json += ",\"relay2_state\":";
-      json += settings.relay2_state ? "true" : "false";
-      json += ",\"relay_pulse_ms\":";
-      json += settings.relay_pulse_ms;
-      json += ",\"auth_enabled\":";
-      json += settings.auth_enabled ? "true" : "false";
-      json += ",\"auth_user\":\"";
-      json += settings.auth_user;
-      json += "\",\"api_key_mask\":\"";
-      json += mask_key(settings.api_key);
-      json += "\"";
-      json += "}";
+      json += valid ? "true" : "false";
+      json += ",\"rtc_status\":";
+      json += json_quote(rtc_state_name(rtc_get_state()));
+#define B(key, field)      \
+  json += ",\"" key "\":"; \
+  json += s.field ? "true" : "false";
+#define T(key, field)      \
+  json += ",\"" key "\":"; \
+  json += json_quote(s.field);
+      B("wifi_client", wifi_client)
+      T("wifi_ssid", wifi_ssid)
+      B("wifi_static", wifi_static)
+      T("wifi_ip", wifi_ip)
+      T("wifi_gateway", wifi_gateway)
+      T("wifi_mask", wifi_mask)
+      T("relay1", relay1_name)
+      T("relay2", relay2_name)
+      B("relay1_state", relay1_state)
+      B("relay2_state", relay2_state) B("auth_enabled", auth_enabled) T("auth_user", auth_user)
+#undef B
+#undef T
+          json += ",\"relay_pulse_ms\":";
+      json += s.relay_pulse_ms;
+      json += ",\"api_key_mask\":";
+      json += json_quote(mask_key(s.api_key).c_str());
+      json += '}';
       server.send(200, "application/json", json);
       return;
     }
-
-    if (server.method() == HTTP_POST) {
-      bool ok = true;
-      bool generated_key = false;
-      bool enabled = false;
-      if (server.hasArg("rtc_enabled")) {
-        enabled = parse_bool_arg(server, "rtc_enabled", false);
-        ok = settings_set_rtc_enabled(enabled);
-        rtc_init(enabled);
-        if (!enabled) {
-          settings_set_rtc_valid(false);
-          rtc_set_time_valid(false);
-        }
-      }
-      auto current = settings_get();
-      bool wifi_client = server.hasArg("wifi_client") ? parse_bool_arg(server, "wifi_client", current.wifi_client) : current.wifi_client;
-      bool has_ssid = server.hasArg("wifi_ssid");
-      bool has_pass = server.hasArg("wifi_pass");
-      String ssid = has_ssid ? server.arg("wifi_ssid") : String(current.wifi_ssid);
-      String pass = has_pass ? server.arg("wifi_pass") : String(current.wifi_pass);
-      bool wifi_static = parse_bool_arg(server, "wifi_static", false);
-      String ip = server.hasArg("wifi_ip") ? server.arg("wifi_ip") : "";
-      String gateway = server.hasArg("wifi_gateway") ? server.arg("wifi_gateway") : "";
-      String mask = server.hasArg("wifi_mask") ? server.arg("wifi_mask") : "";
-      String relay1 = server.hasArg("relay1") ? server.arg("relay1") : "";
-      String relay2 = server.hasArg("relay2") ? server.arg("relay2") : "";
-      String auth_user = server.hasArg("auth_user") ? server.arg("auth_user") : "";
-      String auth_pass = server.hasArg("auth_pass") ? server.arg("auth_pass") : "";
-      bool auth_enabled = server.hasArg("auth_enabled") ? parse_bool_arg(server, "auth_enabled", false) : settings_get().auth_enabled;
-      bool reboot = false;
-      if (has_ssid || has_pass || server.hasArg("wifi_client")) {
-        if (!has_ssid) {
-          ssid = current.wifi_ssid;
-        }
-        if (!has_pass || pass.isEmpty()) {
-          pass = current.wifi_pass;
-        }
-        settings_set_wifi(wifi_client, ssid.c_str(), pass.c_str());
-        if (wifi_client && strlen(ssid.c_str()) > 0) {
-          reboot = true;
-        }
-      }
-      if (server.hasArg("wifi_static")) {
-        settings_set_wifi_static(wifi_static, ip.c_str(), gateway.c_str(), mask.c_str());
-      }
-      if (server.hasArg("relay1") || server.hasArg("relay2")) {
-        settings_set_relay_names(relay1.c_str(), relay2.c_str());
-      }
-      if (server.hasArg("relay_pulse_ms")) {
-        long parsed = server.arg("relay_pulse_ms").toInt();
-        uint32_t duration = parsed > 0 ? static_cast<uint32_t>(parsed) : 0;
-        settings_set_relay_pulse_ms(duration);
-      }
-      if (server.hasArg("auth_enabled")) {
-        auto current_auth = settings_get();
-        char new_key[40] = {0};
-        if (auth_enabled && !current_auth.auth_enabled) {
-          generate_api_key(new_key, sizeof(new_key));
-          generated_key = true;
-        }
-        settings_set_auth(auth_enabled,
-                          auth_user.length() ? auth_user.c_str() : current_auth.auth_user,
-                          auth_pass.length() ? auth_pass.c_str() : current_auth.auth_pass,
-                          generated_key ? new_key : current_auth.api_key);
-        if (!auth_enabled && current_auth.auth_enabled) {
-          clear_sessions();
-        }
-        if (auth_enabled && !current_auth.auth_enabled) {
-          issue_session(server);
-        }
-      }
-      if (generated_key) {
-        String json = "{\"ok\":true,\"api_key\":\"";
-        json += settings_get().api_key;
-        json += "\"";
-        if (reboot) {
-          json += ",\"reboot\":true";
-        }
-        json += "}";
-        server.send(200, "application/json", json);
-      } else if (reboot) {
-        server.send(200, "application/json", ok ? "{\"ok\":true,\"reboot\":true}" : "{\"ok\":false}");
-      } else {
-        server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
-      }
+    if (server.method() != HTTP_POST) {
+      server.send(405, "application/json", "{\"ok\":false}");
       return;
     }
-
-    server.send(405, "application/json", "{\"ok\":false,\"error\":\"method not allowed\"}");
+    bool ok = true, generated = false, reboot = false, changed_auth = false;
+    Settings candidate, old;
+    {
+      StorageLock lock;
+      old = settings_get();
+      candidate = old;
+#define B(key, field) ok = boolean_arg(server, key, &candidate.field) && ok;
+#define T(key, field) ok = text_arg(server, key, candidate.field, sizeof(candidate.field)) && ok;
+      B("rtc_enabled", rtc_enabled)
+      B("wifi_client", wifi_client)
+      B("wifi_static", wifi_static)
+      B("auth_enabled", auth_enabled)
+      T("wifi_ssid", wifi_ssid)
+      T("wifi_ip", wifi_ip)
+      T("wifi_gateway", wifi_gateway)
+      T("wifi_mask", wifi_mask)
+      T("relay1", relay1_name)
+      T("relay2", relay2_name) T("auth_user", auth_user)
+#undef B
+#undef T
+          if (server.hasArg("wifi_pass") &&
+              (server.arg("wifi_pass").length() || !candidate.wifi_client)) ok =
+              text_arg(server, "wifi_pass", candidate.wifi_pass, sizeof(candidate.wifi_pass)) && ok;
+      bool clear_wifi = false;
+      ok = boolean_arg(server, "wifi_pass_clear", &clear_wifi) && ok;
+      if (clear_wifi) candidate.wifi_pass[0] = 0;
+      if (server.hasArg("auth_pass") && server.arg("auth_pass").length())
+        ok = text_arg(server, "auth_pass", candidate.auth_pass, sizeof(candidate.auth_pass)) && ok;
+      ok = uint_arg(server, "relay_pulse_ms", &candidate.relay_pulse_ms, 50, 10000) && ok;
+      if (candidate.auth_enabled && !old.auth_enabled) {
+        generate_api_key(candidate.api_key, sizeof(candidate.api_key));
+        generated = true;
+      }
+      reboot = candidate.wifi_client != old.wifi_client ||
+               strcmp(candidate.wifi_ssid, old.wifi_ssid) ||
+               strcmp(candidate.wifi_pass, old.wifi_pass) ||
+               candidate.wifi_static != old.wifi_static || strcmp(candidate.wifi_ip, old.wifi_ip) ||
+               strcmp(candidate.wifi_gateway, old.wifi_gateway) ||
+               strcmp(candidate.wifi_mask, old.wifi_mask);
+      changed_auth = candidate.auth_enabled != old.auth_enabled ||
+                     strcmp(candidate.auth_user, old.auth_user) ||
+                     strcmp(candidate.auth_pass, old.auth_pass) ||
+                     strcmp(candidate.api_key, old.api_key);
+      ok = ok && settings_apply(candidate);
+    }
+    if (!ok) {
+      result(server, false, "invalid_settings_or_save_failed");
+      return;
+    }
+    if (candidate.rtc_enabled != old.rtc_enabled) rtc_init(candidate.rtc_enabled);
+    if (changed_auth) {
+      clear_sessions();
+      if (candidate.auth_enabled)
+        issue_session(server);
+      else
+        clear_login_cookie(server);
+    }
+    String json = "{\"ok\":true,\"reboot\":";
+    json += reboot ? "true" : "false";
+    json += ",\"rtc_time_valid\":";
+    json += rtc_has_valid_time() ? "true" : "false";
+    json += ",\"rtc_status\":";
+    json += json_quote(rtc_state_name(rtc_get_state()));
+    if (generated) {
+      json += ",\"api_key\":";
+      json += json_quote(candidate.api_key);
+    }
+    json += '}';
+    server.send(200, "application/json", json);
   });
-
   server.on("/rtc", HTTP_ANY, [&]() {
-    if (!check_auth(server)) {
-      send_unauthorized(server, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
-      return;
-    }
+    if (!require_auth(server) || reject_maintenance()) return;
+    RtcDateTime dt{};
     if (server.method() == HTTP_GET) {
-      RtcDateTime dt{};
-      bool ok = rtc_get_datetime(&dt);
-      if (!ok) {
-        server.send(500, "application/json", "{\"ok\":false}");
+      if (!rtc_get_datetime(&dt)) {
+        result(server, false, rtc_state_name(rtc_get_state()));
         return;
       }
-      char buf[32];
-      snprintf(buf, sizeof(buf), "%04u-%02u-%02u %02u:%02u:%02u",
-               dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second);
-      String json = "{\"ok\":true,\"datetime\":\"";
-      json += buf;
-      json += "\"}";
+      char b[32];
+      snprintf(b, sizeof(b), "%04u-%02u-%02u %02u:%02u:%02u", dt.year, dt.month, dt.day, dt.hour,
+               dt.minute, dt.second);
+      String json = "{\"ok\":true,\"datetime\":";
+      json += json_quote(b);
+      json += '}';
       server.send(200, "application/json", json);
-      return;
-    }
-
-    if (server.method() == HTTP_POST) {
-      if (!rtc_is_enabled()) {
-        server.send(400, "application/json", "{\"ok\":false,\"error\":\"rtc_disabled\"}");
+    } else if (server.method() == HTTP_POST) {
+      if (!rtc_parse_datetime(server.arg("datetime").c_str(), &dt)) {
+        result(server, false, "invalid_datetime");
         return;
       }
-      if (!server.hasArg("datetime")) {
-        server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing datetime\"}");
+      if (!rtc_is_enabled() || !storage_write_text("/rtc-adjusting", "1\n")) {
+        result(server, false, "rtc_disabled_or_storage_failed");
         return;
       }
-      String value = server.arg("datetime");
-      value.replace('T', ' ');
-      if (value.length() < 16) {
-        server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid datetime\"}");
-        return;
-      }
-      RtcDateTime dt{};
-      dt.year = static_cast<uint16_t>(value.substring(0, 4).toInt());
-      dt.month = static_cast<uint8_t>(value.substring(5, 7).toInt());
-      dt.day = static_cast<uint8_t>(value.substring(8, 10).toInt());
-      dt.hour = static_cast<uint8_t>(value.substring(11, 13).toInt());
-      dt.minute = static_cast<uint8_t>(value.substring(14, 16).toInt());
-      dt.second = value.length() >= 19 ? static_cast<uint8_t>(value.substring(17, 19).toInt()) : 0;
       bool ok = rtc_set_datetime(dt);
       if (ok) {
-        settings_set_rtc_valid(true);
+        StorageLock lock;
+        ok = LittleFS.remove("/rtc-adjusting");
       }
-      server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
-      return;
-    }
-
-    server.send(405, "application/json", "{\"ok\":false,\"error\":\"method not allowed\"}");
+      result(server, ok, "rtc_update_failed");
+    } else
+      server.send(405, "application/json", "{\"ok\":false}");
   });
-
   server.on("/maintenance/format", HTTP_POST, [&]() {
-    Serial.println("HTTP POST /maintenance/format");
-    if (!check_auth(server)) {
-      send_unauthorized(server, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
+    if (!require_auth(server) || reject_maintenance()) return;
+    if (!app_prepare_maintenance()) {
+      result(server, false, "maintenance_timeout");
       return;
     }
-    bool ok = LittleFS.format();
+    bool ok = storage_format();
     if (ok) {
-      LittleFS.begin();
       settings_init();
-      settings_save();
-      rtc_init(false);
+      ok = settings_save();
     }
-    server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
-  });
-
-  server.on("/maintenance/reboot", HTTP_POST, [&]() {
-    Serial.println("HTTP POST /maintenance/reboot");
-    if (!check_auth(server)) {
-      send_unauthorized(server, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
-      return;
-    }
-    server.send(200, "application/json", "{\"ok\":true}");
-    delay(100);
+    result(server, ok, "format_or_default_save_failed");
+    delay(200);
     ESP.restart();
   });
-
+  server.on("/maintenance/reboot", HTTP_POST, [&]() {
+    if (!require_auth(server)) return;
+    bool ok = app_maintenance() ? log_flush(10000) : app_prepare_maintenance();
+    if (!ok) {
+      result(server, false, "maintenance_timeout");
+      return;
+    }
+    {
+      StorageLock lock;
+      result(server, true);
+      delay(200);
+      ESP.restart();
+    }
+  });
   server.on("/maintenance/uart-test", HTTP_POST, [&]() {
-    if (!check_auth(server)) {
-      send_unauthorized(server, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
-      return;
-    }
-    if (!queues || !queues->uart_cmd_queue) {
-      server.send(500, "application/json", "{\"ok\":false,\"error\":\"no_uart_queue\"}");
-      return;
-    }
+    if (!require_auth(server) || reject_maintenance()) return;
     UartCmd cmd{};
     cmd.type = UartCmd::Type::Ping;
-    cmd.reader_id = 0;
-    cmd.allowed = 0;
-    xQueueSend(queues->uart_cmd_queue, &cmd, 0);
+    uint32_t before = uart_last_pong_ms();
+    if (xQueueSend(queues->uart_cmd_queue, &cmd, 0) != pdTRUE) {
+      uart_note_cmd_drop();
+      result(server, false, "uart_queue_full");
+      return;
+    }
     uint32_t start = millis();
-    uint32_t last = uart_last_pong_ms();
-    bool ok = false;
-    while (millis() - start < 1000) {
-      uint32_t pong = uart_last_pong_ms();
-      if (pong != last) {
-        ok = true;
-        break;
-      }
-      vTaskDelay(pdMS_TO_TICKS(20));
-    }
-    server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+    while (millis() - start < 1000 && uart_last_pong_ms() == before) vTaskDelay(pdMS_TO_TICKS(10));
+    result(server, uart_last_pong_ms() != before, "nano_no_response");
   });
-
   server.on("/maintenance/reader-test", HTTP_POST, [&]() {
-    if (!check_auth(server)) {
-      send_unauthorized(server, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
-      return;
-    }
-    if (!queues || !queues->uart_cmd_queue) {
-      server.send(500, "application/json", "{\"ok\":false,\"error\":\"no_uart_queue\"}");
-      return;
-    }
-    if (!server.hasArg("reader")) {
-      server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing_reader\"}");
-      return;
-    }
-    uint8_t reader_id = static_cast<uint8_t>(server.arg("reader").toInt());
-    if (reader_id != 1 && reader_id != 2) {
-      server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_reader\"}");
-      return;
-    }
+    if (!require_auth(server) || reject_maintenance()) return;
+    uint32_t id = 0;
     String action = server.hasArg("action") ? server.arg("action") : "allow";
-    action.toLowerCase();
+    if (!uint_arg(server, "reader", &id, 1, 2) || !id || (action != "allow" && action != "deny")) {
+      result(server, false, "invalid_reader_action");
+      return;
+    }
     UartCmd cmd{};
     cmd.type = UartCmd::Type::Feedback;
-    cmd.reader_id = reader_id;
-    cmd.allowed = (action != "deny") ? 1 : 0;
-    xQueueSend(queues->uart_cmd_queue, &cmd, 0);
-    server.send(200, "application/json", "{\"ok\":true}");
+    cmd.reader_id = id;
+    cmd.allowed = action == "allow";
+    bool ok = xQueueSend(queues->uart_cmd_queue, &cmd, 0) == pdTRUE;
+    if (!ok) uart_note_cmd_drop();
+    result(server, ok, "uart_queue_full");
   });
-
   server.on("/maintenance/relay", HTTP_POST, [&]() {
-    if (!check_auth(server)) {
-      send_unauthorized(server, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
-      return;
-    }
-    if (!server.hasArg("relay")) {
-      server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing_relay\"}");
-      return;
-    }
-    uint8_t relay_id = static_cast<uint8_t>(server.arg("relay").toInt());
+    if (!require_auth(server) || reject_maintenance()) return;
+    uint32_t id = 0, duration = settings_get().relay_pulse_ms;
     String action = server.hasArg("action") ? server.arg("action") : "pulse";
-    action.toLowerCase();
-    static LogicRequest req;
-    static LogicResponse resp;
-    memset(&req, 0, sizeof(req));
-    memset(&resp, 0, sizeof(resp));
+    if (!uint_arg(server, "relay", &id, 1, 2) || !id ||
+        !uint_arg(server, "duration_ms", &duration, 50, 10000) || !relay_ready()) {
+      result(server, false, "invalid_relay_or_unavailable");
+      return;
+    }
     if (action == "on" || action == "off") {
-      req.type = LogicRequestType::SetRelayState;
-      req.payload.relay_state.relay_id = relay_id;
-      req.payload.relay_state.enabled = (action == "on") ? 1 : 0;
-    } else {
+      bool on = action == "on";
+      if (!settings_set_relay_state(id, on)) {
+        result(server, false, "save_failed");
+        return;
+      }
+      result(server, relay_set_state(id, on));
+    } else if (action == "pulse") {
+      LogicRequest req{};
       req.type = LogicRequestType::TriggerRelay;
-      req.payload.trigger_relay.relay_id = relay_id;
-      uint32_t duration = 0;
-      if (server.hasArg("duration_ms")) {
-        long parsed = server.arg("duration_ms").toInt();
-        duration = parsed > 0 ? static_cast<uint32_t>(parsed) : 0;
-        if (duration < kMinRelayPulseMs) {
-          duration = kMinRelayPulseMs;
-        } else if (duration > kMaxRelayPulseMs) {
-          duration = kMaxRelayPulseMs;
-        }
-      }
+      req.payload.trigger_relay.relay_id = id;
       req.payload.trigger_relay.duration_ms = duration;
-    }
-    if (logic_request(queues, req, &resp, 400)) {
-      server.send(200, "application/json", resp.json);
-    } else {
-      server.send(500, "application/json", "{\"ok\":false}");
-    }
+      send_logic(server, queues, req);
+    } else
+      result(server, false, "invalid_action");
   });
-
-  server.on("/firmware", HTTP_POST,
-    [&]() {
-      if (!check_auth(server)) {
-        send_unauthorized(server, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
-        return;
-      }
-      bool ok = !Update.hasError();
-      server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
-      if (ok) {
-        delay(200);
-        ESP.restart();
-      }
-    },
-    [&]() {
-      if (!check_auth(server)) {
-        return;
-      }
-      HTTPUpload& upload = server.upload();
-      if (upload.status == UPLOAD_FILE_START) {
-        Serial.printf("OTA start: %s\n", upload.filename.c_str());
-        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-          Serial.println("OTA begin failed");
+  server.on(
+      "/firmware", HTTP_POST,
+      [&]() {
+        if (!check_auth(server)) {
+          if (Update.isRunning()) Update.abort();
+          ota_parts = 0;
+          ota_started = ota_completed = false;
+          send_unauthorized(server, "application/json",
+                            "{\"ok\":false,\"error\":\"unauthorized\"}");
+          return;
         }
-      } else if (upload.status == UPLOAD_FILE_WRITE) {
-        if (Update.isRunning()) {
-          if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-            Serial.println("OTA write error");
+        bool ok =
+            ota_parts == 1 && ota_started && ota_completed && !ota_failed && !Update.hasError();
+        bool prepared = ok && app_prepare_maintenance();
+        ok = ok && prepared;
+        if (ok) ok = Update.end(true);  // Commit only after the whole HTTP request was accepted.
+        if (!ok && Update.isRunning()) Update.abort();
+        ota_parts = 0;
+        ota_started = ota_completed = false;
+        ota_failed = false;
+        result(server, ok, "firmware_update_failed");
+        if (ok) {
+          delay(200);
+          ESP.restart();
+        } else if (prepared)
+          app_set_maintenance(false);
+      },
+      [&]() {
+        if (!check_auth(server) || app_maintenance()) {
+          ota_failed = true;
+          return;
+        }
+        HTTPUpload& upload = server.upload();
+        if (upload.status == UPLOAD_FILE_START) {
+          if (++ota_parts != 1) {
+            ota_failed = true;
+            if (Update.isRunning()) Update.abort();
+            return;
           }
-        }
-      } else if (upload.status == UPLOAD_FILE_END) {
-        if (Update.isRunning()) {
-          if (Update.end(true)) {
-            Serial.printf("OTA done: %u bytes\n", upload.totalSize);
-          } else {
-            Serial.println("OTA end failed");
+          ota_failed = false;
+          ota_completed = false;
+          if (Update.isRunning()) Update.abort();
+          ota_started = Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
+          if (!ota_started) ota_failed = true;
+        } else if (upload.status == UPLOAD_FILE_WRITE) {
+          if (ota_started && !ota_failed && Update.isRunning() &&
+              Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+            Update.abort();
+            ota_failed = true;
           }
+        } else if (upload.status == UPLOAD_FILE_END) {
+          ota_completed = ota_started && !ota_failed && Update.isRunning() && upload.totalSize > 0;
+        } else if (upload.status == UPLOAD_FILE_ABORTED) {
+          if (Update.isRunning()) Update.abort();
+          ota_parts = 0;
+          ota_started = ota_completed = false;
+          ota_failed = true;
         }
-      }
-    }
-  );
-
-  server.onNotFound([&]() {
-    Serial.printf("HTTP 404 %s\n", server.uri().c_str());
-    server.send(404, "application/json", "{\"ok\":false,\"error\":\"not found\"}");
-  });
-
+      });
+  server.onNotFound(
+      [&]() { server.send(404, "application/json", "{\"ok\":false,\"error\":\"not_found\"}"); });
   server.begin();
-  Serial.println("Web server started on port 80.");
-
+  Serial.println("HTTP server ready");
   for (;;) {
     server.handleClient();
     vTaskDelay(kWebLoopDelay);
   }
 }
-
-} // namespace app
+}  // namespace app

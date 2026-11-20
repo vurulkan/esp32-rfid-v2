@@ -4,7 +4,7 @@ from pathlib import Path
 root = Path(__file__).parent
 
 def write_gz(src, dst, array):
-    data = (root / src).read_bytes()
+    data = (root / src).read_text(encoding="utf-8").encode("utf-8")
     gz = gzip.compress(data, compresslevel=9, mtime=0)
 
     lines = [
@@ -20,7 +20,9 @@ def write_gz(src, dst, array):
     lines.append("};")
     lines.append(f"const size_t {array}_len = sizeof({array});")
     lines.append("")
-    (root / dst).write_text("\n".join(lines), encoding="ascii")
+    output = "\n".join(lines).encode("ascii")
+    if not (root / dst).exists() or (root / dst).read_bytes() != output:
+        (root / dst).write_bytes(output)
 
 write_gz("index.html", "index.html.gz.h", "index_html_gz")
 write_gz("app.js", "app.js.gz.h", "app_js_gz")

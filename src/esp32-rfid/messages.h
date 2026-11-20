@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include "settings.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
@@ -11,15 +12,13 @@ constexpr size_t kNameMaxLen = 32;
 constexpr size_t kLogicResponseMax = 6144;
 
 struct RfidEvent {
-  uint8_t reader_id; // 1 or 2
+  uint8_t reader_id;  // 1 or 2
   char uid[kUidMaxLen];
+  uint32_t received_ms;
 };
 
 struct UartCmd {
-  enum class Type : uint8_t {
-    Feedback = 0,
-    Ping = 1
-  };
+  enum class Type : uint8_t { Feedback = 0, Ping = 1 };
   Type type;
   uint8_t reader_id;
   uint8_t allowed;
@@ -34,6 +33,7 @@ enum class LogicRequestType : uint8_t {
   ClearLogsAll,
   GetLastRfid,
   ReloadUsers,
+  RestoreUsers,
   TriggerRelay,
   SetRelayState
 };
@@ -41,7 +41,14 @@ enum class LogicRequestType : uint8_t {
 struct LogicRequest {
   LogicRequestType type;
   QueueHandle_t reply_queue;
+  uint32_t request_id;
+  uint32_t deadline_ms;
   union {
+    struct {
+      char path[40];
+      bool has_settings;
+      Settings settings;
+    } restore_users;
     struct {
       char uid[kUidMaxLen];
       char name[kNameMaxLen];
@@ -67,8 +74,9 @@ struct LogicRequest {
 };
 
 struct LogicResponse {
+  uint32_t request_id;
   uint8_t ok;
   char json[kLogicResponseMax];
 };
 
-} // namespace app
+}  // namespace app

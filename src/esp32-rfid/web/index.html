@@ -28,6 +28,7 @@
     </aside>
 
     <main class="content">
+    <div id="request-error" class="hint is-hidden" role="alert"></div>
     <section class="page is-active" id="page-status">
       <header class="page-header">
         <h1>Welcome</h1>
@@ -82,6 +83,7 @@
       <div class="card">
         <div class="card-title">LAST RFID</div>
         <pre id="rfid"></pre>
+        <details><summary>Diagnostics</summary><pre id="diagnostics"></pre></details>
       </div>
     </section>
 
@@ -148,6 +150,7 @@
           <div class="hint">Provide SSID and password to connect.</div>
           <label class="field">SSID <input class="text-input" type="text" id="wifi-ssid" placeholder="Network SSID"></label>
           <label class="field">Password <input class="text-input" type="password" id="wifi-pass" placeholder="Network password"></label>
+          <label class="check"><input type="checkbox" id="wifi-pass-clear">Clear saved WiFi password (open network)</label>
           <label class="check">
             <input type="checkbox" id="wifi-static">
             Use static IP
@@ -184,8 +187,8 @@
           <button id="rtc-set">Set RTC</button>
           <button id="rtc-read">Read RTC</button>
           <div id="rtc-status" class="hint"></div>
-          <button id="rtc-save">Save RTC Settings</button>
-        </div>
+          </div>
+        <button id="rtc-save">Save RTC Settings</button>
       </div>
     </section>
 
@@ -297,7 +300,7 @@
   <footer class="footer">
     <span>Made by <a href="https://github.com/vurulkan" target="_blank" rel="noopener">vurulkan</a></span>
     <span class="footer-sep">|</span>
-    <span>v1.0.0</span>
+    <span>v2.0.1</span>
   </footer>
 
   <script src="/app.js"></script>

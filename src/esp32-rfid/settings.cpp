@@ -1,295 +1,270 @@
 #include "settings.h"
-
+#include "storage.h"
+#include "validation.h"
 #include <LittleFS.h>
-#include <cstring>
-
+#include <IPAddress.h>
+#include <freertos/FreeRTOS.h>
+#include <atomic>
 namespace app {
-
 namespace {
-constexpr const char* kSettingsPath = "/settings.txt";
-Settings g_settings{false, false, false, "", "", false, "", "", "", "Relay 1", "Relay 2", false, false,
-                    kDefaultRelayPulseMs, false, "", "", ""};
-
-uint32_t clamp_relay_pulse_ms(uint32_t duration_ms) {
-  if (duration_ms < kMinRelayPulseMs) {
-    return kMinRelayPulseMs;
-  }
-  if (duration_ms > kMaxRelayPulseMs) {
-    return kMaxRelayPulseMs;
-  }
-  return duration_ms;
+Settings defaults() {
+  Settings s{};
+  strcpy(s.relay1_name, "Relay 1");
+  strcpy(s.relay2_name, "Relay 2");
+  s.relay_pulse_ms = kDefaultRelayPulseMs;
+  return s;
 }
-} // namespace
-
-void settings_init() {
-  g_settings.rtc_enabled = false;
-  g_settings.rtc_time_valid = false;
-  g_settings.wifi_client = false;
-  g_settings.wifi_ssid[0] = '\0';
-  g_settings.wifi_pass[0] = '\0';
-  g_settings.wifi_static = false;
-  g_settings.wifi_ip[0] = '\0';
-  g_settings.wifi_gateway[0] = '\0';
-  g_settings.wifi_mask[0] = '\0';
-  strncpy(g_settings.relay1_name, "Relay 1", sizeof(g_settings.relay1_name) - 1);
-  g_settings.relay1_name[sizeof(g_settings.relay1_name) - 1] = '\0';
-  strncpy(g_settings.relay2_name, "Relay 2", sizeof(g_settings.relay2_name) - 1);
-  g_settings.relay2_name[sizeof(g_settings.relay2_name) - 1] = '\0';
-  g_settings.relay1_state = false;
-  g_settings.relay2_state = false;
-  g_settings.relay_pulse_ms = kDefaultRelayPulseMs;
-  g_settings.auth_enabled = false;
-  g_settings.auth_user[0] = '\0';
-  g_settings.auth_pass[0] = '\0';
-  g_settings.api_key[0] = '\0';
+Settings g_settings = defaults();
+portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
+std::atomic<bool> g_valid{false};
+std::atomic<uint32_t> g_auth_revision{0};
+void publish(const Settings& s) {
+  portENTER_CRITICAL(&g_mux);
+  if (s.auth_enabled != g_settings.auth_enabled || strcmp(s.auth_user, g_settings.auth_user) ||
+      strcmp(s.auth_pass, g_settings.auth_pass) || strcmp(s.api_key, g_settings.api_key))
+    ++g_auth_revision;
+  g_settings = s;
+  portEXIT_CRITICAL(&g_mux);
 }
-
-bool settings_load() {
-  if (!LittleFS.begin()) {
-    return false;
-  }
-  if (!LittleFS.exists(kSettingsPath)) {
-    g_settings.rtc_enabled = false;
+bool boolean(const String& value, bool* out) {
+  if (value == "1" || value == "true" || value == "yes") {
+    *out = true;
     return true;
   }
-  File file = LittleFS.open(kSettingsPath, FILE_READ);
-  if (!file) {
-    return false;
+  if (value == "0" || value == "false" || value == "no") {
+    *out = false;
+    return true;
   }
-  while (file.available()) {
-    String line = file.readStringUntil('\n');
-    line.trim();
-    if (line.startsWith("rtc=")) {
-      String value = line.substring(4);
-      value.trim();
-      g_settings.rtc_enabled = (value == "1" || value == "true" || value == "yes");
-    }
-    if (line.startsWith("rtc_valid=")) {
-      String value = line.substring(10);
-      value.trim();
-      g_settings.rtc_time_valid = (value == "1" || value == "true" || value == "yes");
-    }
-    if (line.startsWith("wifi_client=")) {
-      String value = line.substring(12);
-      value.trim();
-      g_settings.wifi_client = (value == "1" || value == "true" || value == "yes");
-    }
-    if (line.startsWith("wifi_ssid=")) {
-      String value = line.substring(10);
-      value.trim();
-      value.toCharArray(g_settings.wifi_ssid, sizeof(g_settings.wifi_ssid));
-    }
-    if (line.startsWith("wifi_pass=")) {
-      String value = line.substring(10);
-      value.trim();
-      value.toCharArray(g_settings.wifi_pass, sizeof(g_settings.wifi_pass));
-    }
-    if (line.startsWith("wifi_static=")) {
-      String value = line.substring(12);
-      value.trim();
-      g_settings.wifi_static = (value == "1" || value == "true" || value == "yes");
-    }
-    if (line.startsWith("wifi_ip=")) {
-      String value = line.substring(8);
-      value.trim();
-      value.toCharArray(g_settings.wifi_ip, sizeof(g_settings.wifi_ip));
-    }
-    if (line.startsWith("wifi_gateway=")) {
-      String value = line.substring(13);
-      value.trim();
-      value.toCharArray(g_settings.wifi_gateway, sizeof(g_settings.wifi_gateway));
-    }
-    if (line.startsWith("wifi_mask=")) {
-      String value = line.substring(10);
-      value.trim();
-      value.toCharArray(g_settings.wifi_mask, sizeof(g_settings.wifi_mask));
-    }
-    if (line.startsWith("relay1=")) {
-      String value = line.substring(7);
-      value.trim();
-      value.toCharArray(g_settings.relay1_name, sizeof(g_settings.relay1_name));
-    }
-    if (line.startsWith("relay2=")) {
-      String value = line.substring(7);
-      value.trim();
-      value.toCharArray(g_settings.relay2_name, sizeof(g_settings.relay2_name));
-    }
-    if (line.startsWith("relay1_state=")) {
-      String value = line.substring(13);
-      value.trim();
-      g_settings.relay1_state = (value == "1" || value == "true" || value == "yes");
-    }
-    if (line.startsWith("relay2_state=")) {
-      String value = line.substring(13);
-      value.trim();
-      g_settings.relay2_state = (value == "1" || value == "true" || value == "yes");
-    }
-    if (line.startsWith("relay_pulse_ms=")) {
-      String value = line.substring(15);
-      value.trim();
-      long duration = value.toInt();
-      g_settings.relay_pulse_ms = clamp_relay_pulse_ms(duration > 0 ? static_cast<uint32_t>(duration) : 0);
-    }
-    if (line.startsWith("auth_enabled=")) {
-      String value = line.substring(13);
-      value.trim();
-      g_settings.auth_enabled = (value == "1" || value == "true" || value == "yes");
-    }
-    if (line.startsWith("auth_user=")) {
-      String value = line.substring(10);
-      value.trim();
-      value.toCharArray(g_settings.auth_user, sizeof(g_settings.auth_user));
-    }
-    if (line.startsWith("auth_pass=")) {
-      String value = line.substring(10);
-      value.trim();
-      value.toCharArray(g_settings.auth_pass, sizeof(g_settings.auth_pass));
-    }
-    if (line.startsWith("api_key=")) {
-      String value = line.substring(8);
-      value.trim();
-      value.toCharArray(g_settings.api_key, sizeof(g_settings.api_key));
-    }
-  }
-  file.close();
+  return false;
+}
+bool copy_value(const String& value, char* out, size_t len) {
+  if (value.length() >= len || !valid_field(value.c_str(), len, false)) return false;
+  value.toCharArray(out, len);
   return true;
 }
-
-bool settings_save() {
-  if (!LittleFS.begin()) {
-    return false;
-  }
-  File file = LittleFS.open(kSettingsPath, FILE_WRITE);
-  if (!file) {
-    return false;
-  }
-  file.print("rtc=");
-  file.println(g_settings.rtc_enabled ? "1" : "0");
-  file.print("rtc_valid=");
-  file.println(g_settings.rtc_time_valid ? "1" : "0");
-  file.print("wifi_client=");
-  file.println(g_settings.wifi_client ? "1" : "0");
-  file.print("wifi_ssid=");
-  file.println(g_settings.wifi_ssid);
-  file.print("wifi_pass=");
-  file.println(g_settings.wifi_pass);
-  file.print("wifi_static=");
-  file.println(g_settings.wifi_static ? "1" : "0");
-  file.print("wifi_ip=");
-  file.println(g_settings.wifi_ip);
-  file.print("wifi_gateway=");
-  file.println(g_settings.wifi_gateway);
-  file.print("wifi_mask=");
-  file.println(g_settings.wifi_mask);
-  file.print("relay1=");
-  file.println(g_settings.relay1_name);
-  file.print("relay2=");
-  file.println(g_settings.relay2_name);
-  file.print("relay1_state=");
-  file.println(g_settings.relay1_state ? "1" : "0");
-  file.print("relay2_state=");
-  file.println(g_settings.relay2_state ? "1" : "0");
-  file.print("relay_pulse_ms=");
-  file.println(g_settings.relay_pulse_ms);
-  file.print("auth_enabled=");
-  file.println(g_settings.auth_enabled ? "1" : "0");
-  file.print("auth_user=");
-  file.println(g_settings.auth_user);
-  file.print("auth_pass=");
-  file.println(g_settings.auth_pass);
-  file.print("api_key=");
-  file.println(g_settings.api_key);
-  file.close();
-  return true;
+bool ip_valid(const char* text) {
+  IPAddress ip;
+  return ip.fromString(text);
 }
-
+}  // namespace
+uint32_t settings_auth_revision() { return g_auth_revision; }
+void settings_publish_committed(const Settings& s) {
+  publish(s);
+  g_valid = true;
+}
+String settings_export() { return settings_encode(settings_get()); }
+void settings_init() {
+  publish(defaults());
+  g_valid = false;
+}
 Settings settings_get() {
-  return g_settings;
+  portENTER_CRITICAL(&g_mux);
+  Settings s = g_settings;
+  portEXIT_CRITICAL(&g_mux);
+  return s;
 }
-
-bool settings_set_rtc_enabled(bool enabled) {
-  g_settings.rtc_enabled = enabled;
-  return settings_save();
-}
-
-bool settings_set_rtc_valid(bool valid) {
-  g_settings.rtc_time_valid = valid;
-  return settings_save();
-}
-
-bool settings_set_wifi(bool client_mode, const char* ssid, const char* pass) {
-  g_settings.wifi_client = client_mode;
-  if (ssid) {
-    strncpy(g_settings.wifi_ssid, ssid, sizeof(g_settings.wifi_ssid) - 1);
-    g_settings.wifi_ssid[sizeof(g_settings.wifi_ssid) - 1] = '\0';
-  }
-  if (pass) {
-    strncpy(g_settings.wifi_pass, pass, sizeof(g_settings.wifi_pass) - 1);
-    g_settings.wifi_pass[sizeof(g_settings.wifi_pass) - 1] = '\0';
-  }
-  return settings_save();
-}
-
-bool settings_set_wifi_static(bool enabled, const char* ip, const char* gateway, const char* mask) {
-  g_settings.wifi_static = enabled;
-  if (ip) {
-    strncpy(g_settings.wifi_ip, ip, sizeof(g_settings.wifi_ip) - 1);
-    g_settings.wifi_ip[sizeof(g_settings.wifi_ip) - 1] = '\0';
-  }
-  if (gateway) {
-    strncpy(g_settings.wifi_gateway, gateway, sizeof(g_settings.wifi_gateway) - 1);
-    g_settings.wifi_gateway[sizeof(g_settings.wifi_gateway) - 1] = '\0';
-  }
-  if (mask) {
-    strncpy(g_settings.wifi_mask, mask, sizeof(g_settings.wifi_mask) - 1);
-    g_settings.wifi_mask[sizeof(g_settings.wifi_mask) - 1] = '\0';
-  }
-  return settings_save();
-}
-
-bool settings_set_relay_names(const char* relay1, const char* relay2) {
-  if (relay1) {
-    strncpy(g_settings.relay1_name, relay1, sizeof(g_settings.relay1_name) - 1);
-    g_settings.relay1_name[sizeof(g_settings.relay1_name) - 1] = '\0';
-  }
-  if (relay2) {
-    strncpy(g_settings.relay2_name, relay2, sizeof(g_settings.relay2_name) - 1);
-    g_settings.relay2_name[sizeof(g_settings.relay2_name) - 1] = '\0';
-  }
-  return settings_save();
-}
-
-bool settings_set_relay_state(uint8_t relay_id, bool enabled) {
-  if (relay_id == 1) {
-    g_settings.relay1_state = enabled;
-  } else if (relay_id == 2) {
-    g_settings.relay2_state = enabled;
-  } else {
+bool settings_ready() { return g_valid; }
+bool settings_validate(const Settings& s) {
+  if (!valid_field(s.wifi_ssid, sizeof(s.wifi_ssid), false) ||
+      !valid_field(s.wifi_pass, sizeof(s.wifi_pass), false) ||
+      !valid_field(s.relay1_name, sizeof(s.relay1_name), false) ||
+      !valid_field(s.relay2_name, sizeof(s.relay2_name), false) ||
+      !valid_field(s.auth_user, sizeof(s.auth_user), false) ||
+      !valid_field(s.auth_pass, sizeof(s.auth_pass), false) ||
+      !valid_field(s.api_key, sizeof(s.api_key), false) || s.relay_pulse_ms < 50 ||
+      s.relay_pulse_ms > 10000)
     return false;
+  if (s.auth_enabled && (!s.auth_user[0] || !s.auth_pass[0] || !s.api_key[0])) return false;
+  if (s.wifi_client && !s.wifi_ssid[0]) return false;
+  if (s.wifi_static) {
+    if (!ip_valid(s.wifi_ip) || !ip_valid(s.wifi_gateway) || !ip_valid(s.wifi_mask)) return false;
+    IPAddress mask;
+    mask.fromString(s.wifi_mask);
+    uint32_t m =
+        (uint32_t(mask[0]) << 24) | (uint32_t(mask[1]) << 16) | (uint32_t(mask[2]) << 8) | mask[3];
+    uint32_t inv = ~m;
+    if (!m || (inv & (inv + 1))) return false;
   }
-  return settings_save();
+  return true;
 }
-
-bool settings_set_relay_pulse_ms(uint32_t duration_ms) {
-  g_settings.relay_pulse_ms = clamp_relay_pulse_ms(duration_ms);
-  return settings_save();
+String settings_encode(const Settings& s) {
+  String out;
+  if (!out.reserve(1000)) return String();
+#define BOOL(key, field)      \
+  out += key "=";             \
+  out += s.field ? "1" : "0"; \
+  out += '\n';
+#define TEXT(key, field) \
+  out += key "=";        \
+  out += s.field;        \
+  out += '\n';
+  BOOL("rtc", rtc_enabled)
+  BOOL("rtc_valid", rtc_time_valid)
+  BOOL("wifi_client", wifi_client)
+  TEXT("wifi_ssid", wifi_ssid) TEXT("wifi_pass", wifi_pass) BOOL("wifi_static", wifi_static)
+      TEXT("wifi_ip", wifi_ip) TEXT("wifi_gateway", wifi_gateway) TEXT("wifi_mask", wifi_mask)
+          TEXT("relay1", relay1_name) TEXT("relay2", relay2_name) BOOL("relay1_state", relay1_state)
+              BOOL("relay2_state", relay2_state) out += "relay_pulse_ms=";
+  out += s.relay_pulse_ms;
+  out += '\n';
+  BOOL("auth_enabled", auth_enabled)
+  TEXT("auth_user", auth_user)
+  TEXT("auth_pass", auth_pass)
+  TEXT("api_key", api_key)
+#undef BOOL
+#undef TEXT
+      return out;
 }
-
-bool settings_set_auth(bool enabled, const char* user, const char* pass, const char* api_key) {
-  g_settings.auth_enabled = enabled;
-  if (user) {
-    strncpy(g_settings.auth_user, user, sizeof(g_settings.auth_user) - 1);
-    g_settings.auth_user[sizeof(g_settings.auth_user) - 1] = '\0';
+bool settings_parse_text(const String& text, Settings* s) {
+  if (!s || text.length() > 4096 || strlen(text.c_str()) != text.length()) return false;
+  int start = 0;
+  bool any = false;
+  String seen = "|";
+  while (start < int(text.length())) {
+    int end = text.indexOf('\n', start);
+    if (end < 0) end = text.length();
+    String line = text.substring(start, end);
+    start = end + 1;
+    if (line.endsWith("\r")) line.remove(line.length() - 1);
+    if (!line.length()) continue;
+    int split = line.indexOf('=');
+    if (split <= 0) return false;
+    String key = line.substring(0, split), value = line.substring(split + 1);
+    String marker = key + "|";
+    if (seen.indexOf("|" + marker) >= 0) return false;
+    seen += marker;
+    bool ok = false;
+#define B(keyname, field)           \
+  if (key == keyname)               \
+    ok = boolean(value, &s->field); \
+  else
+#define T(keyname, field)                               \
+  if (key == keyname)                                   \
+    ok = copy_value(value, s->field, sizeof(s->field)); \
+  else
+    B("rtc", rtc_enabled)
+    B("rtc_valid", rtc_time_valid)
+    B("wifi_client", wifi_client)
+    T("wifi_ssid", wifi_ssid) T("wifi_pass", wifi_pass) B("wifi_static", wifi_static)
+        T("wifi_ip", wifi_ip) T("wifi_gateway", wifi_gateway) T("wifi_mask", wifi_mask)
+            T("relay1", relay1_name) T("relay2", relay2_name) B("relay1_state", relay1_state)
+                B("relay2_state", relay2_state) B("auth_enabled", auth_enabled)
+                    T("auth_user", auth_user) T("auth_pass", auth_pass)
+                        T("api_key", api_key) if (key == "relay_pulse_ms") {
+      ok = value.length() > 0;
+      for (size_t i = 0; i < value.length(); ++i)
+        if (value[i] < '0' || value[i] > '9') ok = false;
+      long n = value.toInt();
+      if (n < 50 || n > 10000) ok = false;
+      if (ok) s->relay_pulse_ms = n;
+    }
+    else return false;
+#undef B
+#undef T
+    if (!ok) return false;
+    any = true;
   }
-  if (pass) {
-    strncpy(g_settings.auth_pass, pass, sizeof(g_settings.auth_pass) - 1);
-    g_settings.auth_pass[sizeof(g_settings.auth_pass) - 1] = '\0';
-  }
-  if (api_key) {
-    strncpy(g_settings.api_key, api_key, sizeof(g_settings.api_key) - 1);
-    g_settings.api_key[sizeof(g_settings.api_key) - 1] = '\0';
-  }
-  return settings_save();
+  return any && settings_validate(*s);
 }
-
-} // namespace app
+bool settings_apply(const Settings& s) {
+  StorageLock lock;
+  if (!lock || !settings_validate(s)) return false;
+  String encoded = settings_encode(s);
+  if (!encoded.length() || !storage_write_text("/settings.txt", encoded)) return false;
+  publish(s);
+  g_valid = true;
+  return true;
+}
+bool settings_load() {
+  StorageLock lock;
+  if (!lock || !storage_ready()) return false;
+  if (!LittleFS.exists("/settings.txt")) {
+    g_valid = true;
+    return true;
+  }
+  String text;
+  Settings s = defaults();
+  bool ok = storage_read_text("/settings.txt", &text, 4096);
+  for (const char* key :
+       {"auth_enabled=", "auth_user=", "auth_pass=", "api_key=", "wifi_client=", "rtc="})
+    if (!text.startsWith(key) && text.indexOf(String("\n") + key) < 0) ok = false;
+  if (ok) ok = settings_parse_text(text, &s);
+  if (ok) {
+    publish(s);
+    g_valid = true;
+  } else {
+    s = defaults();
+    s.auth_enabled = true;
+    publish(s);
+    g_valid = false;
+  }
+  return ok;
+}
+bool settings_save() { return settings_apply(settings_get()); }
+template <class F>
+bool mutate(F change) {
+  StorageLock lock;
+  if (!lock) return false;
+  Settings s = settings_get();
+  if (!change(s)) return false;
+  return settings_apply(s);
+}
+bool settings_set_rtc_enabled(bool value) {
+  return mutate([&](Settings& s) {
+    s.rtc_enabled = value;
+    return true;
+  });
+}
+bool settings_set_rtc_valid(bool value) {
+  return mutate([&](Settings& s) {
+    s.rtc_time_valid = value;
+    return true;
+  });
+}
+bool settings_set_wifi(bool client, const char* ssid, const char* pass) {
+  return mutate([&](Settings& s) {
+    s.wifi_client = client;
+    return (!ssid || copy_value(ssid, s.wifi_ssid, sizeof(s.wifi_ssid))) &&
+           (!pass || copy_value(pass, s.wifi_pass, sizeof(s.wifi_pass)));
+  });
+}
+bool settings_set_wifi_static(bool value, const char* ip, const char* gw, const char* mask) {
+  return mutate([&](Settings& s) {
+    s.wifi_static = value;
+    return copy_value(ip ? ip : "", s.wifi_ip, sizeof(s.wifi_ip)) &&
+           copy_value(gw ? gw : "", s.wifi_gateway, sizeof(s.wifi_gateway)) &&
+           copy_value(mask ? mask : "", s.wifi_mask, sizeof(s.wifi_mask));
+  });
+}
+bool settings_set_relay_names(const char* a, const char* b) {
+  return mutate([&](Settings& s) {
+    return (!a || copy_value(a, s.relay1_name, sizeof(s.relay1_name))) &&
+           (!b || copy_value(b, s.relay2_name, sizeof(s.relay2_name)));
+  });
+}
+bool settings_set_relay_state(uint8_t id, bool value) {
+  return mutate([&](Settings& s) {
+    if (id == 1)
+      s.relay1_state = value;
+    else if (id == 2)
+      s.relay2_state = value;
+    else
+      return false;
+    return true;
+  });
+}
+bool settings_set_relay_pulse_ms(uint32_t value) {
+  return mutate([&](Settings& s) {
+    s.relay_pulse_ms = value;
+    return true;
+  });
+}
+bool settings_set_auth(bool value, const char* user, const char* pass, const char* key) {
+  return mutate([&](Settings& s) {
+    s.auth_enabled = value;
+    return (!user || copy_value(user, s.auth_user, sizeof(s.auth_user))) &&
+           (!pass || copy_value(pass, s.auth_pass, sizeof(s.auth_pass))) &&
+           (!key || copy_value(key, s.api_key, sizeof(s.api_key)));
+  });
+}
+}  // namespace app
